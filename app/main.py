@@ -15,7 +15,7 @@ from pathlib import Path
 from logging.handlers import TimedRotatingFileHandler
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request   # ← Agregamos Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 
 # --- Cargar variables de entorno ---
@@ -61,7 +61,7 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.5.0")  # ↑ bump menor por nueva ruta
+app = FastAPI(title="Asistente SDP - API puente", version="1.5.2")
 
 
 # ============================================================================
@@ -75,47 +75,101 @@ app = FastAPI(title="Asistente SDP - API puente", version="1.5.0")  # ↑ bump m
 #   - Implementa un bot mínimo: welcome + respuesta a "hi/hello/hola".
 # Salida esperada:
 #   - HTTP 200 en /api/messages si procesa la actividad.
+
 try:
-    from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
+    from botbuilder.core import (
+        BotFrameworkAdapter,
+        BotFrameworkAdapterSettings,
+        TurnContext,
+        ActivityHandler,
+    )
     from botbuilder.schema import Activity
-except Exception as _e:  # Importación opcional: si no está instalado, devolvemos 500 al usar la ruta
+    try:
+        # Si el token/JWT del canal no valida, capturamos 401 de forma explícita
+        from botframework.connector.auth import AuthenticationError  # type: ignore
+    except Exception:
+        class AuthenticationError(Exception):
+            ...
+except Exception:
     BotFrameworkAdapter = None
     BotFrameworkAdapterSettings = None
     TurnContext = None
     Activity = None
-    logger.warning("botbuilder-core no disponible: instala 'botbuilder-core' y 'botbuilder-schema'.")
+    ActivityHandler = object  # fallback inocuo
+    class AuthenticationError(Exception):
+        ...
+    logger.warning("botbuilder-core/schema no disponibles. Instala dependencias del Bot Framework.")
 
-MICROSOFT_APP_ID = os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID")
-MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword") or os.getenv("MicrosoftApp_PASSWORD") or os.getenv("MICROSOFT_APP_PASSWORD")
+# Soportamos nombres de env en PascalCase y UPPER_CASE
+MICROSOFT_APP_ID = (
+    os.getenv("MicrosoftAppId")
+    or os.getenv("MICROSOFT_APP_ID")
+    or ""
+)
+MICROSOFT_APP_PASSWORD = (
+    os.getenv("MicrosoftAppPassword")
+    or os.getenv("MICROSOFT_APP_PASSWORD")
+    or ""
+)
 
 _adapter = None
 if BotFrameworkAdapterSettings and BotFrameworkAdapter:
     _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
     _adapter = BotFrameworkAdapter(_settings)
+    logger.info(
+        "BF adapter listo | app_id=...%s | secret=%s",
+        MICROSOFT_APP_ID[-4:] if MICROSOFT_APP_ID else "----",
+        "ok" if bool(MICROSOFT_APP_PASSWORD) else "missing",
+    )
 
-class AdmInfraBot:
+    # --- on_turn_error: captura excepciones dentro del turno y las loguea ---
+    async def _on_error(turn_context: "TurnContext", error: Exception):
+        """
+        Entrada:
+            - Excepción ocurrida en el pipeline del bot.
+        Qué hace:
+            - Log con stacktrace y avisa al usuario.
+        Salida esperada:
+            - Mensaje de error amable al usuario.
+        """
+        logger.exception(f"[on_turn_error] {error}")
+        try:
+            await turn_context.send_activity("Ups, tuve un problema procesando tu mensaje. Intentémoslo de nuevo.")
+        except Exception:
+            pass
+
+    _adapter.on_turn_error = _on_error
+
+class AdmInfraBot(ActivityHandler):
     """Bot mínimo para validación de canal (welcome + saludo básico)."""
 
-    async def on_turn(self, turn_context: "TurnContext"):
-        atype = turn_context.activity.type
+    async def on_message_activity(self, turn_context: "TurnContext"):
+        """
+        Entrada:
+            - turn_context.activity.text: texto del usuario.
+        Qué hace:
+            - Responde saludo y eco simple (para validación).
+        Salida esperada:
+            - Mensaje de texto.
+        """
+        text = (turn_context.activity.text or "").strip().lower()
+        if text in ("hi", "hello", "hola"):
+            await turn_context.send_activity("¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?")
+        else:
+            await turn_context.send_activity(f"Recibí: {turn_context.activity.text}")
 
-        if atype == "message":
-            text = (turn_context.activity.text or "").strip().lower()
-
-            # Respuesta mínima para validación y diagnóstico
-            if text in ("hi", "hello", "hola"):
-                await turn_context.send_activity("¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?")
-                return
-
-            # Aquí, luego, conectamos Azure OpenAI (call_openai) y/o intents a SDP
-            await turn_context.send_activity("Recibido. Procesando tu solicitud.")
-
-        elif atype == "conversationUpdate":
-            # Mensaje de bienvenida cuando agregan el bot (personal o team scope)
-            for m in (turn_context.activity.members_added or []):
-                if m.id != turn_context.activity.recipient.id:
-                    await turn_context.send_activity("Bienvenido/a a AdmInfraBot 👋")
-
+    async def on_members_added_activity(self, members_added, turn_context: "TurnContext"):
+        """
+        Entrada:
+            - members_added: usuarios añadidos a la conversación.
+        Qué hace:
+            - Envía mensaje de bienvenida cuando agregan el bot.
+        Salida esperada:
+            - Mensaje de bienvenida.
+        """
+        for m in (members_added or []):
+            if m.id != turn_context.activity.recipient.id:
+                await turn_context.send_activity("Bienvenido/a a AdmInfraBot 👋")
 
 _bot_instance = AdmInfraBot()
 
@@ -130,7 +184,10 @@ async def messages(request: Request):
         - Deserializa la actividad y la procesa con el adapter de Bot Framework.
         - Registra trazabilidad / logs de diagnóstico (sin romper la conversación).
     Salida esperada:
-        - HTTP 200 sin contenido si se procesa correctamente.
+        - 200 si procesa correctamente.
+        - 401 si la firma/token no valida.
+        - 400 si el body no es JSON válido.
+        - 500 ante error inesperado del adapter.
     """
     if _adapter is None or Activity is None:
         logger.error("Intento de uso de /api/messages sin botbuilder-core instalado.")
@@ -142,14 +199,51 @@ async def messages(request: Request):
     except Exception:
         pass
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        logger.exception(f"JSON inválido en /api/messages: {e}")
+        raise HTTPException(status_code=400, detail="Invalid activity payload")
+
     activity = Activity().deserialize(body)
     auth_header = request.headers.get("Authorization", "")
 
-    # Procesar la actividad con tu bot
-    await _adapter.process_activity(activity, auth_header, lambda ctx: _bot_instance.on_turn(ctx))
+    # Log corto de diagnóstico de la actividad
+    try:
+        logger.info(
+            "BF activity: type=%s | channel=%s | conv=%s",
+            getattr(activity, "type", "-"),
+            getattr(activity, "channel_id", "-"),
+            getattr(getattr(activity, "conversation", None), "id", "-"),
+        )
+    except Exception:
+        pass
 
-    return Response(status_code=200)
+    try:
+        # ActivityHandler despacha automáticamente a on_message_activity / on_members_added_activity
+        invoke_response = await _adapter.process_activity(
+            activity,
+            auth_header,
+            lambda ctx: _bot_instance.on_turn(ctx),
+        )
+
+        # Si es una actividad "invoke", devolvemos el invokeResponse apropiado
+        if invoke_response is not None:
+            status_code = getattr(invoke_response, "status", None) or 200
+            body_obj = getattr(invoke_response, "body", None)
+            content = json.dumps(body_obj) if isinstance(body_obj, (dict, list)) else (body_obj or "")
+            media = "application/json" if isinstance(body_obj, (dict, list)) else "text/plain"
+            return Response(content=content, media_type=media, status_code=status_code)
+
+        # Para mensajes normales, 200 vacío
+        return Response(status_code=200)
+
+    except AuthenticationError as e:
+        logger.warning(f"Auth BotFramework (401): {e}")
+        return Response(status_code=401, content="Unauthorized")
+    except Exception as e:
+        logger.exception(f"Error procesando actividad BF: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail="Adapter error")
 
 
 # ============================================================================
