@@ -19,3 +19,4 @@ logs/
 # Editor/IDE
 .vscode/
 .idea/
+*.bak
