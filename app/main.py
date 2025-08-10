@@ -1,4 +1,4 @@
-# asistente_sdp/app/main.py
+# app/main.py
 """
 API puente para integrar un bot conversacional con ServiceDesk Plus.
 Incluye logging diario con retención de 60 días y trazabilidad en base de datos.
@@ -266,13 +266,13 @@ def health_bot_creds():
 def dev_test_token():
     """
     Prueba directa contra AAD usando Client Credentials para el recurso de Bot Framework.
+    Authority correcto: botframework.com
     """
     try:
         import msal
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MSAL no disponible: {e}")
 
-    # 👇 Authority correcto para Bot Framework (público)
     authority = "https://login.microsoftonline.com/botframework.com"
     scope = ["https://api.botframework.com/.default"]
 
@@ -282,10 +282,12 @@ def dev_test_token():
         authority=authority,
     )
     res = cca.acquire_token_for_client(scopes=scope)
-    safe = {k: v for k, v in res.items() if k != "access_token"}
+    safe = {k: v for k, v in res.items() if k != "access_token"}  # ocultar token
     safe["has_access_token"] = "access_token" in res
     return safe
 
+# ¡importante! incluir el router de diagnóstico
+app.include_router(diag)
 
 
 # ============================================================================
@@ -315,6 +317,10 @@ def health():
         pass
     return {"status": "ok"}
 
+# Sonda para confirmar versión de código en producción
+@app.get("/__ready")
+def __ready():
+    return {"ok": True, "source": "app/main.py"}
 
 @app.get("/announcements/active")
 def announcements_active():
@@ -327,7 +333,6 @@ def announcements_active():
         log_exec(endpoint="/announcements/active", action="announcements", ok=False, code=502, message=str(e))
         logger.error(f"Error obteniendo anuncios: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
-
 
 @app.post("/intents/create")
 def intent_create(subject: str, description: str, email: str):
@@ -343,7 +348,6 @@ def intent_create(subject: str, description: str, email: str):
         logger.error(f"Error creando ticket: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
-
 @app.get("/intents/status")
 def intent_status(email: str, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=200)):
     logger.info(f"Listando tickets | requester={email} | page={page} | size={page_size}")
@@ -357,7 +361,6 @@ def intent_status(email: str, page: int = Query(1, ge=1), page_size: int = Query
                  params={"page": page, "page_size": page_size}, ok=False, code=502, message=str(e))
         logger.error(f"Error listando tickets: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
-
 
 @app.get("/intents/status_by_display")
 def intent_status_by_display(display_id: str):
@@ -373,7 +376,6 @@ def intent_status_by_display(display_id: str):
         logger.error(f"Error consultando ticket {display_id}: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
-
 @app.post("/intents/note")
 def intent_note(ticket_id: int, email: str, note: str):
     logger.info(f"Agregando nota | ticket_id={ticket_id} | requester={email}")
@@ -387,7 +389,6 @@ def intent_note(ticket_id: int, email: str, note: str):
                  params={"ticket_id": ticket_id}, ok=False, code=502, message=str(e))
         logger.error(f"Error agregando nota a ticket {ticket_id}: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
-
 
 @app.post("/intents/note_by_display")
 def intent_note_by_display(display_id: str, email: str, note: str):
@@ -403,7 +404,6 @@ def intent_note_by_display(display_id: str, email: str, note: str):
         logger.error(f"Error agregando nota a ticket {display_id}: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
-
 @app.get("/meta/sites")
 def meta_sites():
     logger.info("Listando sites de SDP.")
@@ -416,7 +416,6 @@ def meta_sites():
         logger.error(f"Error listando sites: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
-
 @app.get("/meta/request_templates")
 def meta_templates():
     logger.info("Listando plantillas de solicitud.")
@@ -428,7 +427,6 @@ def meta_templates():
         log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message=str(e))
         logger.error(f"Error listando plantillas: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
-
 
 @app.get("/meta/trace/recent")
 def trace_recent(limit: int = Query(50, ge=1, le=500)):
