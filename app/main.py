@@ -61,20 +61,12 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.5.2")
+app = FastAPI(title="Asistente SDP - API puente", version="1.5.3")
 
 
 # ============================================================================
 # Bot Framework: Adapter y endpoint /api/messages
 # ============================================================================
-
-# Entrada:
-#   - CREDENCIALES de Azure AD (MicrosoftAppId / MicrosoftAppPassword) vía env.
-# Qué hace:
-#   - Configura el adapter de Bot Framework y publica POST /api/messages para Teams.
-#   - Implementa un bot mínimo: welcome + respuesta a "hi/hello/hola".
-# Salida esperada:
-#   - HTTP 200 en /api/messages si procesa la actividad.
 
 try:
     from botbuilder.core import (
@@ -82,10 +74,10 @@ try:
         BotFrameworkAdapterSettings,
         TurnContext,
         ActivityHandler,
+        MessageFactory,
     )
     from botbuilder.schema import Activity
     try:
-        # Si el token/JWT del canal no valida, capturamos 401 de forma explícita
         from botframework.connector.auth import AuthenticationError  # type: ignore
     except Exception:
         class AuthenticationError(Exception):
@@ -96,6 +88,7 @@ except Exception:
     TurnContext = None
     Activity = None
     ActivityHandler = object  # fallback inocuo
+    MessageFactory = None
     class AuthenticationError(Exception):
         ...
     logger.warning("botbuilder-core/schema no disponibles. Instala dependencias del Bot Framework.")
@@ -124,15 +117,7 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 
     # --- on_turn_error: captura excepciones dentro del turno y las loguea ---
     async def _on_error(turn_context: "TurnContext", error: Exception):
-        """
-        Entrada:
-            - Excepción ocurrida en el pipeline del bot.
-        Qué hace:
-            - Log con stacktrace y avisa al usuario.
-        Salida esperada:
-            - Mensaje de error amable al usuario.
-        """
-        logger.exception(f"[on_turn_error] {error}")
+        logger.exception("[on_turn_error] %s", error)
         try:
             await turn_context.send_activity("Ups, tuve un problema procesando tu mensaje. Intentémoslo de nuevo.")
         except Exception:
@@ -140,36 +125,38 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 
     _adapter.on_turn_error = _on_error
 
+# Guardamos una reference para pruebas de envío saliente
+LAST_REF = {"ref": None}
+
+
 class AdmInfraBot(ActivityHandler):
     """Bot mínimo para validación de canal (welcome + saludo básico)."""
 
     async def on_message_activity(self, turn_context: "TurnContext"):
-        """
-        Entrada:
-            - turn_context.activity.text: texto del usuario.
-        Qué hace:
-            - Responde saludo y eco simple (para validación).
-        Salida esperada:
-            - Mensaje de texto.
-        """
         text = (turn_context.activity.text or "").strip().lower()
-        if text in ("hi", "hello", "hola"):
-            await turn_context.send_activity("¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?")
-        else:
-            await turn_context.send_activity(f"Recibí: {turn_context.activity.text}")
+        logger.info("on_message_activity IN | text=%s", text)
+        try:
+            reply_text = "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?" if text in ("hi", "hello", "hola") else f"Recibí: {turn_context.activity.text}"
+            res = await turn_context.send_activity(MessageFactory.text(reply_text))
+            sent_id = getattr(res, "id", None)
+            logger.info("on_message_activity OUT | sent_id=%s", sent_id)
+            try:
+                log_exec(endpoint="/api/messages", action="bf_sent", params={"id": sent_id}, ok=True)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.exception("send_activity failed: %s", e)
+            try:
+                log_exec(endpoint="/api/messages", action="bf_send_error", ok=False, message=str(e))
+            except Exception:
+                pass
+            raise
 
     async def on_members_added_activity(self, members_added, turn_context: "TurnContext"):
-        """
-        Entrada:
-            - members_added: usuarios añadidos a la conversación.
-        Qué hace:
-            - Envía mensaje de bienvenida cuando agregan el bot.
-        Salida esperada:
-            - Mensaje de bienvenida.
-        """
         for m in (members_added or []):
             if m.id != turn_context.activity.recipient.id:
                 await turn_context.send_activity("Bienvenido/a a AdmInfraBot 👋")
+
 
 _bot_instance = AdmInfraBot()
 
@@ -199,17 +186,16 @@ async def messages(request: Request):
     except Exception:
         pass
 
+    # Body
     try:
         body = await request.json()
     except Exception as e:
-        logger.exception(f"JSON inválido en /api/messages: {e}")
+        logger.exception("JSON inválido en /api/messages: %s", e)
         raise HTTPException(status_code=400, detail="Invalid activity payload")
 
-
-    
     activity = Activity().deserialize(body)
-    auth_header = request.headers.get("Authorization", "")
-    # Diagnóstico: log detallado de la actividad
+
+    # Log diagnóstico de la actividad
     try:
         ainfo = {
             "type": activity.type,
@@ -219,29 +205,63 @@ async def messages(request: Request):
             "fromId": getattr(getattr(activity, "from_property", None), "id", None),
             "text": (getattr(activity, "text", None) or "")[:200],
         }
-        logger.info(f"BF activity: {json.dumps(ainfo, ensure_ascii=False)}")
+        logger.info("BF activity: %s", json.dumps(ainfo, ensure_ascii=False))
         log_exec(endpoint="/api/messages", action="bf_activity", params=ainfo, ok=True)
     except Exception as e:
-        logger.warning(f"No se pudo loguear ainfo: {e}")
+        logger.warning("No se pudo loguear ainfo: %s", e)
 
+    # Guarda conversation reference para pruebas /dev/ping
+    try:
+        LAST_REF["ref"] = TurnContext.get_conversation_reference(activity)
+    except Exception:
+        pass
 
-        # Si es una actividad "invoke", devolvemos el invokeResponse apropiado
-        if invoke_response is not None:
-            status_code = getattr(invoke_response, "status", None) or 200
-            body_obj = getattr(invoke_response, "body", None)
-            content = json.dumps(body_obj) if isinstance(body_obj, (dict, list)) else (body_obj or "")
-            media = "application/json" if isinstance(body_obj, (dict, list)) else "text/plain"
-            return Response(content=content, media_type=media, status_code=status_code)
+    # Auth header
+    auth_header = request.headers.get("Authorization", "")
+    logger.info("BF auth header present=%s", bool(auth_header))
 
-        # Para mensajes normales, 200 vacío
-        return Response(status_code=200)
-
+    # Procesar la actividad con el bot
+    try:
+        invoke_response = await _adapter.process_activity(
+            activity, auth_header, lambda ctx: _bot_instance.on_turn(ctx)
+        )
     except AuthenticationError as e:
-        logger.warning(f"Auth BotFramework (401): {e}")
+        logger.warning("Auth BotFramework (401): %s", e)
         return Response(status_code=401, content="Unauthorized")
     except Exception as e:
-        logger.exception(f"Error procesando actividad BF: {type(e).__name__}: {e}")
+        logger.exception("Error procesando actividad BF: %s: %s", type(e).__name__, e)
         raise HTTPException(status_code=500, detail="Adapter error")
+
+    # Si es una actividad "invoke", devolver el invokeResponse apropiado
+    if invoke_response is not None:
+        status_code = getattr(invoke_response, "status", None) or 200
+        body_obj = getattr(invoke_response, "body", None)
+        if isinstance(body_obj, (dict, list)):
+            content = json.dumps(body_obj)
+            media = "application/json"
+        elif isinstance(body_obj, str):
+            content = body_obj
+            media = "text/plain"
+        else:
+            content = ""
+            media = "text/plain"
+        return Response(content=content, media_type=media, status_code=status_code)
+
+    # Para mensajes normales, 200 vacío
+    return Response(status_code=200)
+
+
+# Endpoint de ping (solo si está habilitado DEV_TRACE_ENABLED)
+if DEV_TRACE_ENABLED:
+    @app.post("/dev/ping")
+    async def dev_ping():
+        if not LAST_REF["ref"]:
+            raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
+        async def _send(ctx: TurnContext):
+            res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
+            logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
+        await _adapter.continue_conversation(MICROSOFT_APP_ID, LAST_REF["ref"], _send)
+        return {"ok": True}
 
 
 # ============================================================================
@@ -250,35 +270,16 @@ async def messages(request: Request):
 
 @app.get("/health")
 def health():
-    """
-    Entrada:
-        - Ninguna.
-    Qué hace:
-        - Verifica que el API está activo.
-        - Registra log y traza de disponibilidad.
-    Salida esperada:
-        - JSON con {"status": "ok"}.
-    """
     logger.info("Health check solicitado.")
     try:
         log_exec(endpoint="/health", action="health", ok=True)
     except Exception:
-        # Si la trazabilidad falla, no rompemos el health.
         pass
     return {"status": "ok"}
 
 
 @app.get("/announcements/active")
 def announcements_active():
-    """
-    Entrada:
-        - Ninguna.
-    Qué hace:
-        - Lista anuncios activos en SDP.
-        - Registra trazabilidad (éxito/error) con acción 'announcements'.
-    Salida esperada:
-        - dict con clave "announcements": lista de anuncios normalizados.
-    """
     logger.info("Solicitud de anuncios activos.")
     try:
         res = get_announcements()
@@ -292,17 +293,6 @@ def announcements_active():
 
 @app.post("/intents/create")
 def intent_create(subject: str, description: str, email: str):
-    """
-    Entrada:
-        - subject (str): asunto del ticket.
-        - description (str): descripción del ticket.
-        - email (str): correo del solicitante.
-    Qué hace:
-        - Crea un ticket en SDP.
-        - Registra trazabilidad con acción 'create' (params: subject).
-    Salida esperada:
-        - dict con datos del ticket creado.
-    """
     logger.info(f"Creando ticket | requester={email} | subject={subject}")
     try:
         res = create_ticket(email, subject, description)
@@ -318,17 +308,6 @@ def intent_create(subject: str, description: str, email: str):
 
 @app.get("/intents/status")
 def intent_status(email: str, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=200)):
-    """
-    Entrada:
-        - email (str): correo del solicitante.
-        - page (int): número de página (>=1).
-        - page_size (int): tamaño de página (1..200).
-    Qué hace:
-        - Lista tickets del solicitante (cascada V0→V3).
-        - Registra trazabilidad con acción 'list_mine' y paginación.
-    Salida esperada:
-        - dict con 'list_info' y 'requests'.
-    """
     logger.info(f"Listando tickets | requester={email} | page={page} | size={page_size}")
     try:
         res = list_my_tickets(email, page, page_size)
@@ -344,15 +323,6 @@ def intent_status(email: str, page: int = Query(1, ge=1), page_size: int = Query
 
 @app.get("/intents/status_by_display")
 def intent_status_by_display(display_id: str):
-    """
-    Entrada:
-        - display_id (str): ID visible del ticket.
-    Qué hace:
-        - Devuelve estado compacto del ticket (GET directo o búsqueda por display_id).
-        - Registra trazabilidad con acción 'status_by_display'.
-    Salida esperada:
-        - dict con 'ticket' (compacto) y 'raw' (datos soporte).
-    """
     logger.info(f"Consultando estado | display_id={display_id}")
     try:
         res = get_ticket_status_by_display(display_id)
@@ -368,17 +338,6 @@ def intent_status_by_display(display_id: str):
 
 @app.post("/intents/note")
 def intent_note(ticket_id: int, email: str, note: str):
-    """
-    Entrada:
-        - ticket_id (int): ID interno en SDP.
-        - email (str): correo del autor de la nota.
-        - note (str): texto de la nota.
-    Qué hace:
-        - Agrega una nota al ticket.
-        - Registra trazabilidad con acción 'note'.
-    Salida esperada:
-        - dict con confirmación/resultado de SDP.
-    """
     logger.info(f"Agregando nota | ticket_id={ticket_id} | requester={email}")
     try:
         res = add_note(ticket_id, email, note)
@@ -394,17 +353,6 @@ def intent_note(ticket_id: int, email: str, note: str):
 
 @app.post("/intents/note_by_display")
 def intent_note_by_display(display_id: str, email: str, note: str):
-    """
-    Entrada:
-        - display_id (str): ID visible del ticket.
-        - email (str): correo del autor de la nota.
-        - note (str): texto de la nota.
-    Qué hace:
-        - Agrega una nota al ticket por display_id (resuelve ID si aplica).
-        - Registra trazabilidad con acción 'note_by_display'.
-    Salida esperada:
-        - dict con confirmación/resultado de SDP.
-    """
     logger.info(f"Agregando nota por display | display_id={display_id} | requester={email}")
     try:
         res = add_note_by_display_id(display_id, email, note)
@@ -418,18 +366,8 @@ def intent_note_by_display(display_id: str, email: str, note: str):
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
 
-# --- Meta utilitarios ---
 @app.get("/meta/sites")
 def meta_sites():
-    """
-    Entrada:
-        - Ninguna.
-    Qué hace:
-        - Lista todos los sites configurados en SDP.
-        - Registra trazabilidad con acción 'meta_sites'.
-    Salida esperada:
-        - dict con sitios de SDP.
-    """
     logger.info("Listando sites de SDP.")
     try:
         res = list_sites()
@@ -443,15 +381,6 @@ def meta_sites():
 
 @app.get("/meta/request_templates")
 def meta_templates():
-    """
-    Entrada:
-        - Ninguna.
-    Qué hace:
-        - Lista todas las plantillas de solicitud en SDP.
-        - Registra trazabilidad con acción 'meta_templates'.
-    Salida esperada:
-        - dict con plantillas de solicitud de SDP.
-    """
     logger.info("Listando plantillas de solicitud.")
     try:
         res = list_request_templates()
@@ -465,29 +394,16 @@ def meta_templates():
 
 @app.get("/meta/trace/recent")
 def trace_recent(limit: int = Query(50, ge=1, le=500)):
-    """
-    Entrada:
-        - limit (int): cantidad máxima de registros a devolver (1..500).
-    Qué hace:
-        - Devuelve las últimas ejecuciones registradas (vía list_recent) para diagnóstico.
-        - Re-formatea a salida legible: 'fecha_hora' primero y JSON indentado.
-        - Solo visible si DEV_TRACE_ENABLED=true.
-    Salida esperada:
-        - JSON (indentado) como lista de objetos:
-          {fecha_hora, id, endpoint, email, action, params, ok, code, message}.
-    """
     if not DEV_TRACE_ENABLED:
         raise HTTPException(status_code=404, detail="Not Found")
 
     try:
         raw = list_recent(limit)
-
-        # Reordenar campos y formatear fecha para lectura web
         items = []
         for r in raw:
-            fecha_hora = r["ts"].replace("T", " ").replace("Z", "")  # ej: 2025-08-09 18:15:14
+            fecha_hora = r["ts"].replace("T", " ").replace("Z", "")
             items.append({
-                "fecha_hora": fecha_hora,  # primero para lectura
+                "fecha_hora": fecha_hora,
                 "id": r["id"],
                 "endpoint": r["endpoint"],
                 "email": r["email"],
@@ -497,8 +413,6 @@ def trace_recent(limit: int = Query(50, ge=1, le=500)):
                 "code": r["code"],
                 "message": r["message"],
             })
-
-        # Responder bonito para browser (JSON indentado)
         body = json.dumps(items, ensure_ascii=False, indent=2)
         return Response(content=body, media_type="application/json")
     except Exception as e:
