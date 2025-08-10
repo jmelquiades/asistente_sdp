@@ -17,6 +17,7 @@ from logging.handlers import TimedRotatingFileHandler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
+from fastapi import APIRouter
 
 # --- Cargar variables de entorno ---
 load_dotenv()
@@ -61,7 +62,7 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.5.3")
+app = FastAPI(title="Asistente SDP - API puente", version="1.5.4")
 
 
 # ============================================================================
@@ -78,6 +79,7 @@ try:
     )
     from botbuilder.schema import Activity
     try:
+        # Algunas instalaciones exponen AuthenticationError aquí; añadimos fallback
         from botframework.connector.auth import AuthenticationError  # type: ignore
     except Exception:
         class AuthenticationError(Exception):
@@ -93,16 +95,19 @@ except Exception:
         ...
     logger.warning("botbuilder-core/schema no disponibles. Instala dependencias del Bot Framework.")
 
-# Soportamos nombres de env en PascalCase y UPPER_CASE
+# --- Lectura robusta de credenciales (alias + strip) ---
 MICROSOFT_APP_ID = (
-    os.getenv("MicrosoftAppId")
-    or os.getenv("MICROSOFT_APP_ID")
-    or ""
-)
+    os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID") or ""
+).strip()
+
 MICROSOFT_APP_PASSWORD = (
-    os.getenv("MicrosoftAppPassword")
-    or os.getenv("MICROSOFT_APP_PASSWORD")
-    or ""
+    os.getenv("MicrosoftAppPassword") or os.getenv("MICROSOFT_APP_PASSWORD") or ""
+).strip()
+
+logger.info(
+    "[boot] BF creds -> app_tail=%s pwd_len=%s",
+    (MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None),
+    (len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0),
 )
 
 _adapter = None
@@ -110,16 +115,16 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
     _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
     _adapter = BotFrameworkAdapter(_settings)
     logger.info(
-        "BF adapter listo | app_id=...%s | secret=%s",
-        MICROSOFT_APP_ID[-4:] if MICROSOFT_APP_ID else "----",
+        "[bf] adapter listo | app_tail=%s | secret=%s",
+        MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else "------",
         "ok" if bool(MICROSOFT_APP_PASSWORD) else "missing",
     )
 
-    # --- on_turn_error: captura excepciones dentro del turno y las loguea ---
+    # --- on_turn_error: captura excepciones en el turno y las loguea ---
     async def _on_error(turn_context: "TurnContext", error: Exception):
-        logger.exception("[on_turn_error] %s", error)
+        logger.exception("[bf.on_error] %s", error)
         try:
-            await turn_context.send_activity("Ups, tuve un problema procesando tu mensaje. Intentémoslo de nuevo.")
+            await turn_context.send_activity("Ups, ocurrió un problema procesando tu mensaje. Intentemos nuevamente.")
         except Exception:
             pass
 
@@ -165,16 +170,8 @@ _bot_instance = AdmInfraBot()
 async def messages(request: Request):
     """
     Entrada:
-        - Body: Activity del Bot Framework (Teams) en JSON.
+        - Body: Activity del Bot Framework (Teams/WebChat) en JSON.
         - Header: Authorization (portador / firma del canal).
-    Qué hace:
-        - Deserializa la actividad y la procesa con el adapter de Bot Framework.
-        - Registra trazabilidad / logs de diagnóstico (sin romper la conversación).
-    Salida esperada:
-        - 200 si procesa correctamente.
-        - 401 si la firma/token no valida.
-        - 400 si el body no es JSON válido.
-        - 500 ante error inesperado del adapter.
     """
     if _adapter is None or Activity is None:
         logger.error("Intento de uso de /api/messages sin botbuilder-core instalado.")
@@ -251,7 +248,50 @@ async def messages(request: Request):
     return Response(status_code=200)
 
 
+# ============================================================================
+# Endpoints de diagnóstico (credenciales y token AAD)
+# ============================================================================
+diag = APIRouter()
+
+@diag.get("/health/botcreds")
+def health_bot_creds():
+    return {
+        "has_app_id": bool(MICROSOFT_APP_ID),
+        "app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
+        "has_password": bool(MICROSOFT_APP_PASSWORD),
+        "pwd_len": len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0,
+    }
+
+@diag.get("/dev/test_token")
+def dev_test_token():
+    """
+    Prueba directa contra AAD usando Client Credentials para el recurso de Bot Framework.
+    Si algo falla, devuelve el 'error' y 'error_description' exactos de AAD (sin exponer el access_token).
+    """
+    try:
+        import msal
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MSAL no disponible: {e}")
+
+    authority = "https://login.microsoftonline.com/organizations"  # multi-tenant
+    scope = ["https://api.botframework.com/.default"]
+
+    cca = msal.ConfidentialClientApplication(
+        client_id=MICROSOFT_APP_ID,
+        client_credential=MICROSOFT_APP_PASSWORD,
+        authority=authority,
+    )
+    res = cca.acquire_token_for_client(scopes=scope)
+    safe = {k: v for k, v in res.items() if k != "access_token"}  # ocultamos el token
+    safe["has_access_token"] = "access_token" in res
+    return safe
+
+app.include_router(diag)
+
+
+# ============================================================================
 # Endpoint de ping (solo si está habilitado DEV_TRACE_ENABLED)
+# ============================================================================
 if DEV_TRACE_ENABLED:
     @app.post("/dev/ping")
     async def dev_ping():
@@ -267,7 +307,6 @@ if DEV_TRACE_ENABLED:
 # ============================================================================
 # Endpoints existentes (se mantienen igual)
 # ============================================================================
-
 @app.get("/health")
 def health():
     logger.info("Health check solicitado.")
