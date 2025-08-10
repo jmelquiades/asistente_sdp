@@ -62,7 +62,7 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.5.9")
+app = FastAPI(title="Asistente SDP - API puente", version="1.6.0")
 
 
 # ============================================================================
@@ -79,14 +79,10 @@ try:
     from botbuilder.schema import Activity
     try:
         # Algunas instalaciones exponen AuthenticationError aquí; añadimos fallback
-        from botframework.connector.auth import AuthenticationError  # type: ignore
+        from botframework.connector.auth import AuthenticationError, MicrosoftAppCredentials  # type: ignore
     except Exception:
         class AuthenticationError(Exception):
             ...
-    # Confiar serviceUrl para evitar 401 al responder
-    try:
-        from botframework.connector.auth import MicrosoftAppCredentials  # type: ignore
-    except Exception:
         class MicrosoftAppCredentials:  # fallback inofensivo si no está disponible
             @staticmethod
             def trust_service_url(url: str) -> None:
@@ -122,19 +118,32 @@ logger.info(
 )
 
 _adapter = None
+_settings = None
 if BotFrameworkAdapterSettings and BotFrameworkAdapter:
     _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
+
     # 👇 Forzar tenant público del Bot Framework para auth de canal (Web Chat/Teams)
     try:
         setattr(_settings, "channel_auth_tenant", "botframework.com")
     except Exception:
         pass
 
+    # 👇 Scope moderno AAD v2 para el servicio de canales
+    try:
+        current_scope = getattr(_settings, "oauth_scope", None)
+        desired_scope = "https://api.botframework.com/.default"
+        if current_scope != desired_scope:
+            setattr(_settings, "oauth_scope", desired_scope)
+    except Exception:
+        pass
+
     _adapter = BotFrameworkAdapter(_settings)
     logger.info(
-        "[bf] adapter listo | app_tail=%s | secret=%s",
+        "[bf] adapter listo | app_tail=%s | secret=%s | tenant=%s | scope=%s",
         MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else "------",
         "ok" if bool(MICROSOFT_APP_PASSWORD) else "missing",
+        getattr(_settings, "channel_auth_tenant", None),
+        getattr(_settings, "oauth_scope", None),
     )
 
     # --- on_turn_error: captura excepciones en el turno y las loguea ---
@@ -458,7 +467,7 @@ def meta_sites():
     except Exception as e:
         log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message=str(e))
         logger.error(f"Error listando sites: {e}")
-        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+        raise HTTPException(status_code=502, detail="SDP error: {}".format(e))
 
 @app.get("/meta/request_templates")
 def meta_templates():
@@ -470,7 +479,7 @@ def meta_templates():
     except Exception as e:
         log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message=str(e))
         logger.error(f"Error listando plantillas: {e}")
-        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+        raise HTTPException(status_code=502, detail="SDP error: {}".format(e))
 
 @app.get("/meta/trace/recent")
 def trace_recent(limit: int = Query(50, ge=1, le=500)):
