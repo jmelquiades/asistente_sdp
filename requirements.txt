@@ -5,3 +5,5 @@ python-dotenv
 beautifulsoup4
 botbuilder-core
 botbuilder-schema
+botframework-connector
+aiohttp
