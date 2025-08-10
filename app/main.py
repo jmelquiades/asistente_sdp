@@ -101,9 +101,9 @@ except Exception:
     class AuthenticationError(Exception):
         ...
     class MicrosoftAppCredentials:
-        @staticmethod
-        def trust_service_url(url: str) -> None:
-            pass
+            @staticmethod
+            def trust_service_url(url: str) -> None:
+                pass
     logger.warning("botbuilder-core/schema no disponibles. Instala dependencias del Bot Framework.")
 
 # --- Lectura robusta de credenciales (alias + strip) ---
@@ -423,7 +423,7 @@ def intent_note(ticket_id: int, email: str, note: str):
         return res
     except Exception as e:
         log_exec(endpoint="/intents/note", email=email, action="note",
-                 params={"ticket_id": ticket_id}, ok=False, code=502, message:str(e))
+                 params={"ticket_id": ticket_id}, ok=False, code=502, message=str(e))
         logger.error(f"Error agregando nota a ticket {ticket_id}: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
@@ -437,7 +437,7 @@ def intent_note_by_display(display_id: str, email: str, note: str):
         return res
     except Exception as e:
         log_exec(endpoint="/intents/note_by_display", email=email, action="note_by_display",
-                 params={"display_id": display_id}, ok=False, code=502, message:str(e))
+                 params={"display_id": display_id}, ok=False, code=502, message=str(e))
         logger.error(f"Error agregando nota a ticket {display_id}: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
@@ -449,7 +449,7 @@ def meta_sites():
         log_exec(endpoint="/meta/sites", action="meta_sites", ok=True)
         return res
     except Exception as e:
-        log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message:str(e))
+        log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message=str(e))
         logger.error(f"Error listando sites: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
@@ -461,7 +461,7 @@ def meta_templates():
         log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=True)
         return res
     except Exception as e:
-        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message:str(e))
+        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message=str(e))
         logger.error(f"Error listando plantillas: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
