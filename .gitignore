@@ -1,8 +1,21 @@
-.env
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.sqlite3
-.env.*
+.env
+venv/
+env/
+.venv/
 
+# Logs
+logs/
+*.log
+
+# Editor/IDE
+.vscode/
+.idea/
