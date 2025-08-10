@@ -205,27 +205,25 @@ async def messages(request: Request):
         logger.exception(f"JSON inválido en /api/messages: {e}")
         raise HTTPException(status_code=400, detail="Invalid activity payload")
 
+
+    
     activity = Activity().deserialize(body)
     auth_header = request.headers.get("Authorization", "")
-
-    # Log corto de diagnóstico de la actividad
+    # Diagnóstico: log detallado de la actividad
     try:
-        logger.info(
-            "BF activity: type=%s | channel=%s | conv=%s",
-            getattr(activity, "type", "-"),
-            getattr(activity, "channel_id", "-"),
-            getattr(getattr(activity, "conversation", None), "id", "-"),
-        )
-    except Exception:
-        pass
+        ainfo = {
+            "type": activity.type,
+            "channelId": getattr(activity, "channel_id", None),
+            "serviceUrl": getattr(activity, "service_url", None),
+            "conversationId": getattr(getattr(activity, "conversation", None), "id", None),
+            "fromId": getattr(getattr(activity, "from_property", None), "id", None),
+            "text": (getattr(activity, "text", None) or "")[:200],
+        }
+        logger.info(f"BF activity: {json.dumps(ainfo, ensure_ascii=False)}")
+        log_exec(endpoint="/api/messages", action="bf_activity", params=ainfo, ok=True)
+    except Exception as e:
+        logger.warning(f"No se pudo loguear ainfo: {e}")
 
-    try:
-        # ActivityHandler despacha automáticamente a on_message_activity / on_members_added_activity
-        invoke_response = await _adapter.process_activity(
-            activity,
-            auth_header,
-            lambda ctx: _bot_instance.on_turn(ctx),
-        )
 
         # Si es una actividad "invoke", devolvemos el invokeResponse apropiado
         if invoke_response is not None:
