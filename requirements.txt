@@ -7,3 +7,7 @@ botbuilder-core
 botbuilder-schema
 botframework-connector
 aiohttp
+botbuilder-core>=4.14,<5.0
+botbuilder-schema>=4.14,<5.0
+botframework-connector>=4.14,<5.0
+aiohttp>=3.8,<4
