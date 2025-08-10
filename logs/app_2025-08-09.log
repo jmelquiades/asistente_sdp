@@ -1,0 +1,16 @@
+2025-08-09 12:58:58 [INFO] asistente_sdp - Consultando estado por display_id 99999999
+2025-08-09 12:58:58 [ERROR] asistente_sdp - Error consultando ticket 99999999: [SDP HTTP GET] 400: {"response_status":{"status_code":4000,"messages":[{"status_code":4001,"type":"failed","message":"Datos de entrada no válidos","fields":["display_id"]}],"status":"failed"}}
+2025-08-09 12:59:30 [INFO] asistente_sdp - Listando tickets para juan.melquiades@criteria.pe, página 1
+2025-08-09 13:04:47 [INFO] asistente_sdp - Creando ticket para juan.melquiades@criteria.pe - Asunto: Prueba bot_Criteria_Teams
+2025-08-09 13:12:46 [INFO] asistente_sdp - Health check solicitado.
+2025-08-09 13:13:19 [INFO] asistente_sdp - Solicitud de anuncios activos.
+2025-08-09 13:15:01 [INFO] asistente_sdp - Listando tickets | requester=juan.melquiades@criteria.pe | page=1 | size=2
+2025-08-09 13:15:14 [INFO] asistente_sdp - Solicitud de anuncios activos.
+2025-08-09 13:15:34 [INFO] asistente_sdp - Consulta de trazas recientes | limit=5
+2025-08-09 13:21:36 [ERROR] asistente_sdp - Error consultando trazas recientes: no such table: trace
+2025-08-09 13:22:48 [ERROR] asistente_sdp - Error consultando trazas recientes: no such table: trace
+2025-08-09 13:35:53 [INFO] asistente_sdp - Solicitud de anuncios activos.
+2025-08-09 13:35:55 [INFO] asistente_sdp - Solicitud de anuncios activos.
+2025-08-09 13:36:53 [INFO] asistente_sdp - Solicitud de anuncios activos.
+2025-08-09 13:37:27 [INFO] asistente_sdp - Listando tickets | requester=juan.melquiades@criteria.pe | page=1 | size=2
+2025-08-09 13:40:02 [INFO] asistente_sdp - Creando ticket | requester=juan.melquiades@criteria.pe | subject=Prueba ticket desde curl

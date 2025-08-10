@@ -1,0 +1,322 @@
+# asistente_sdp/app/main.py
+"""
+API puente para integrar un bot conversacional con ServiceDesk Plus.
+Incluye logging diario con retención de 60 días y trazabilidad en base de datos.
+
+Entradas: Peticiones HTTP desde el bot u otros sistemas.
+Salidas: Respuestas JSON con datos de SDP o confirmación de operaciones.
+"""
+
+import os
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from logging.handlers import TimedRotatingFileHandler
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response
+
+# --- Cargar variables de entorno ---
+load_dotenv()
+
+from app.modules.sdp_actions import (
+    get_announcements,
+    create_ticket,
+    list_my_tickets,
+    add_note,
+    add_note_by_display_id,
+    get_ticket_status_by_display,
+    list_sites,
+    list_request_templates,
+)
+from app.modules.trazabilidad import log_exec, list_recent  # trazabilidad
+
+# --- Config de feature flags ---
+DEV_TRACE_ENABLED = os.getenv("DEV_TRACE_ENABLED", "false").lower() in ("1", "true", "yes")
+
+# --- Configuración de logs (rotación diaria, 60 días) ---
+LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+log_filename = LOG_DIR / f"app_{datetime.now().strftime('%Y-%m-%d')}.log"
+
+handler = TimedRotatingFileHandler(
+    filename=log_filename,
+    when="midnight",
+    interval=1,
+    backupCount=60,  # Mantener 60 días de logs
+    encoding="utf-8",
+)
+formatter = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+handler.setFormatter(formatter)
+
+logger = logging.getLogger("asistente_sdp")
+logger.setLevel(logging.INFO)
+# Evita duplicar handlers en reloads
+if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
+    logger.addHandler(handler)
+
+# --- Crear aplicación FastAPI ---
+app = FastAPI(title="Asistente SDP - API puente", version="1.4.2")
+
+
+@app.get("/health")
+def health():
+    """
+    Entrada:
+        - Ninguna.
+    Qué hace:
+        - Verifica que el API está activo.
+        - Registra log y traza de disponibilidad.
+    Salida esperada:
+        - JSON con {"status": "ok"}.
+    """
+    logger.info("Health check solicitado.")
+    try:
+        log_exec(endpoint="/health", action="health", ok=True)
+    except Exception:
+        # Si la trazabilidad falla, no rompemos el health.
+        pass
+    return {"status": "ok"}
+
+
+@app.get("/announcements/active")
+def announcements_active():
+    """
+    Entrada:
+        - Ninguna.
+    Qué hace:
+        - Lista anuncios activos en SDP.
+        - Registra trazabilidad (éxito/error) con acción 'announcements'.
+    Salida esperada:
+        - dict con clave "announcements": lista de anuncios normalizados.
+    """
+    logger.info("Solicitud de anuncios activos.")
+    try:
+        res = get_announcements()
+        log_exec(endpoint="/announcements/active", action="announcements", ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/announcements/active", action="announcements", ok=False, code=502, message=str(e))
+        logger.error(f"Error obteniendo anuncios: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+@app.post("/intents/create")
+def intent_create(subject: str, description: str, email: str):
+    """
+    Entrada:
+        - subject (str): asunto del ticket.
+        - description (str): descripción del ticket.
+        - email (str): correo del solicitante.
+    Qué hace:
+        - Crea un ticket en SDP.
+        - Registra trazabilidad con acción 'create' (params: subject).
+    Salida esperada:
+        - dict con datos del ticket creado.
+    """
+    logger.info(f"Creando ticket | requester={email} | subject={subject}")
+    try:
+        res = create_ticket(email, subject, description)
+        log_exec(endpoint="/intents/create", email=email, action="create",
+                 params={"subject": subject}, ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/intents/create", email=email, action="create",
+                 params={"subject": subject}, ok=False, code=502, message=str(e))
+        logger.error(f"Error creando ticket: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+@app.get("/intents/status")
+def intent_status(email: str, page: int = Query(1, ge=1), page_size: int = Query(25, ge=1, le=200)):
+    """
+    Entrada:
+        - email (str): correo del solicitante.
+        - page (int): número de página (>=1).
+        - page_size (int): tamaño de página (1..200).
+    Qué hace:
+        - Lista tickets del solicitante (cascada V0→V3).
+        - Registra trazabilidad con acción 'list_mine' y paginación.
+    Salida esperada:
+        - dict con 'list_info' y 'requests'.
+    """
+    logger.info(f"Listando tickets | requester={email} | page={page} | size={page_size}")
+    try:
+        res = list_my_tickets(email, page, page_size)
+        log_exec(endpoint="/intents/status", email=email, action="list_mine",
+                 params={"page": page, "page_size": page_size}, ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/intents/status", email=email, action="list_mine",
+                 params={"page": page, "page_size": page_size}, ok=False, code=502, message=str(e))
+        logger.error(f"Error listando tickets: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+@app.get("/intents/status_by_display")
+def intent_status_by_display(display_id: str):
+    """
+    Entrada:
+        - display_id (str): ID visible del ticket.
+    Qué hace:
+        - Devuelve estado compacto del ticket (GET directo o búsqueda por display_id).
+        - Registra trazabilidad con acción 'status_by_display'.
+    Salida esperada:
+        - dict con 'ticket' (compacto) y 'raw' (datos soporte).
+    """
+    logger.info(f"Consultando estado | display_id={display_id}")
+    try:
+        res = get_ticket_status_by_display(display_id)
+        log_exec(endpoint="/intents/status_by_display", action="status_by_display",
+                 params={"display_id": display_id}, ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/intents/status_by_display", action="status_by_display",
+                 params={"display_id": display_id}, ok=False, code=502, message=str(e))
+        logger.error(f"Error consultando ticket {display_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+@app.post("/intents/note")
+def intent_note(ticket_id: int, email: str, note: str):
+    """
+    Entrada:
+        - ticket_id (int): ID interno en SDP.
+        - email (str): correo del autor de la nota.
+        - note (str): texto de la nota.
+    Qué hace:
+        - Agrega una nota al ticket.
+        - Registra trazabilidad con acción 'note'.
+    Salida esperada:
+        - dict con confirmación/resultado de SDP.
+    """
+    logger.info(f"Agregando nota | ticket_id={ticket_id} | requester={email}")
+    try:
+        res = add_note(ticket_id, email, note)
+        log_exec(endpoint="/intents/note", email=email, action="note",
+                 params={"ticket_id": ticket_id}, ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/intents/note", email=email, action="note",
+                 params={"ticket_id": ticket_id}, ok=False, code=502, message=str(e))
+        logger.error(f"Error agregando nota a ticket {ticket_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+@app.post("/intents/note_by_display")
+def intent_note_by_display(display_id: str, email: str, note: str):
+    """
+    Entrada:
+        - display_id (str): ID visible del ticket.
+        - email (str): correo del autor de la nota.
+        - note (str): texto de la nota.
+    Qué hace:
+        - Agrega una nota al ticket por display_id (resuelve ID si aplica).
+        - Registra trazabilidad con acción 'note_by_display'.
+    Salida esperada:
+        - dict con confirmación/resultado de SDP.
+    """
+    logger.info(f"Agregando nota por display | display_id={display_id} | requester={email}")
+    try:
+        res = add_note_by_display_id(display_id, email, note)
+        log_exec(endpoint="/intents/note_by_display", email=email, action="note_by_display",
+                 params={"display_id": display_id}, ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/intents/note_by_display", email=email, action="note_by_display",
+                 params={"display_id": display_id}, ok=False, code=502, message=str(e))
+        logger.error(f"Error agregando nota a ticket {display_id}: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+# --- Meta utilitarios ---
+@app.get("/meta/sites")
+def meta_sites():
+    """
+    Entrada:
+        - Ninguna.
+    Qué hace:
+        - Lista todos los sites configurados en SDP.
+        - Registra trazabilidad con acción 'meta_sites'.
+    Salida esperada:
+        - dict con sitios de SDP.
+    """
+    logger.info("Listando sites de SDP.")
+    try:
+        res = list_sites()
+        log_exec(endpoint="/meta/sites", action="meta_sites", ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message=str(e))
+        logger.error(f"Error listando sites: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+@app.get("/meta/request_templates")
+def meta_templates():
+    """
+    Entrada:
+        - Ninguna.
+    Qué hace:
+        - Lista todas las plantillas de solicitud en SDP.
+        - Registra trazabilidad con acción 'meta_templates'.
+    Salida esperada:
+        - dict con plantillas de solicitud de SDP.
+    """
+    logger.info("Listando plantillas de solicitud.")
+    try:
+        res = list_request_templates()
+        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=True)
+        return res
+    except Exception as e:
+        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message=str(e))
+        logger.error(f"Error listando plantillas: {e}")
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
+
+
+@app.get("/meta/trace/recent")
+def trace_recent(limit: int = Query(50, ge=1, le=500)):
+    """
+    Entrada:
+        - limit (int): cantidad máxima de registros a devolver (1..500).
+    Qué hace:
+        - Devuelve las últimas ejecuciones registradas (vía list_recent) para diagnóstico.
+        - Re-formatea a salida legible: 'fecha_hora' primero y JSON indentado.
+        - Solo visible si DEV_TRACE_ENABLED=true.
+    Salida esperada:
+        - JSON (indentado) como lista de objetos:
+          {fecha_hora, id, endpoint, email, action, params, ok, code, message}.
+    """
+    if not DEV_TRACE_ENABLED:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    try:
+        raw = list_recent(limit)
+
+        # Reordenar campos y formatear fecha para lectura web
+        items = []
+        for r in raw:
+            fecha_hora = r["ts"].replace("T", " ").replace("Z", "")  # ej: 2025-08-09 18:15:14
+            items.append({
+                "fecha_hora": fecha_hora,  # primero para lectura
+                "id": r["id"],
+                "endpoint": r["endpoint"],
+                "email": r["email"],
+                "action": r["action"],
+                "params": r.get("params", {}),
+                "ok": r["ok"],
+                "code": r["code"],
+                "message": r["message"],
+            })
+
+        # Responder bonito para browser (JSON indentado)
+        body = json.dumps(items, ensure_ascii=False, indent=2)
+        return Response(content=body, media_type="application/json")
+    except Exception as e:
+        logger.error(f"Error leyendo trazas: {e}")
+        raise HTTPException(status_code=500, detail="Trace read error")
