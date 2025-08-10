@@ -266,14 +266,14 @@ def health_bot_creds():
 def dev_test_token():
     """
     Prueba directa contra AAD usando Client Credentials para el recurso de Bot Framework.
-    Si algo falla, devuelve el 'error' y 'error_description' exactos de AAD (sin exponer el access_token).
     """
     try:
         import msal
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MSAL no disponible: {e}")
 
-    authority = "https://login.microsoftonline.com/organizations"  # multi-tenant
+    # 👇 Authority correcto para Bot Framework (público)
+    authority = "https://login.microsoftonline.com/botframework.com"
     scope = ["https://api.botframework.com/.default"]
 
     cca = msal.ConfidentialClientApplication(
@@ -282,11 +282,10 @@ def dev_test_token():
         authority=authority,
     )
     res = cca.acquire_token_for_client(scopes=scope)
-    safe = {k: v for k, v in res.items() if k != "access_token"}  # ocultamos el token
+    safe = {k: v for k, v in res.items() if k != "access_token"}
     safe["has_access_token"] = "access_token" in res
     return safe
 
-app.include_router(diag)
 
 
 # ============================================================================
