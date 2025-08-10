@@ -61,7 +61,7 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.5.1")
+app = FastAPI(title="Asistente SDP - API puente", version="1.5.2")
 
 
 # ============================================================================
@@ -121,6 +121,24 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
         MICROSOFT_APP_ID[-4:] if MICROSOFT_APP_ID else "----",
         "ok" if bool(MICROSOFT_APP_PASSWORD) else "missing",
     )
+
+    # --- on_turn_error: captura excepciones dentro del turno y las loguea ---
+    async def _on_error(turn_context: "TurnContext", error: Exception):
+        """
+        Entrada:
+            - Excepción ocurrida en el pipeline del bot.
+        Qué hace:
+            - Log con stacktrace y avisa al usuario.
+        Salida esperada:
+            - Mensaje de error amable al usuario.
+        """
+        logger.exception(f"[on_turn_error] {error}")
+        try:
+            await turn_context.send_activity("Ups, tuve un problema procesando tu mensaje. Intentémoslo de nuevo.")
+        except Exception:
+            pass
+
+    _adapter.on_turn_error = _on_error
 
 class AdmInfraBot(ActivityHandler):
     """Bot mínimo para validación de canal (welcome + saludo básico)."""
@@ -190,10 +208,36 @@ async def messages(request: Request):
     activity = Activity().deserialize(body)
     auth_header = request.headers.get("Authorization", "")
 
+    # Log corto de diagnóstico de la actividad
+    try:
+        logger.info(
+            "BF activity: type=%s | channel=%s | conv=%s",
+            getattr(activity, "type", "-"),
+            getattr(activity, "channel_id", "-"),
+            getattr(getattr(activity, "conversation", None), "id", "-"),
+        )
+    except Exception:
+        pass
+
     try:
         # ActivityHandler despacha automáticamente a on_message_activity / on_members_added_activity
-        await _adapter.process_activity(activity, auth_header, lambda ctx: _bot_instance.on_turn(ctx))
+        invoke_response = await _adapter.process_activity(
+            activity,
+            auth_header,
+            lambda ctx: _bot_instance.on_turn(ctx),
+        )
+
+        # Si es una actividad "invoke", devolvemos el invokeResponse apropiado
+        if invoke_response is not None:
+            status_code = getattr(invoke_response, "status", None) or 200
+            body_obj = getattr(invoke_response, "body", None)
+            content = json.dumps(body_obj) if isinstance(body_obj, (dict, list)) else (body_obj or "")
+            media = "application/json" if isinstance(body_obj, (dict, list)) else "text/plain"
+            return Response(content=content, media_type=media, status_code=status_code)
+
+        # Para mensajes normales, 200 vacío
         return Response(status_code=200)
+
     except AuthenticationError as e:
         logger.warning(f"Auth BotFramework (401): {e}")
         return Response(status_code=401, content="Unauthorized")
