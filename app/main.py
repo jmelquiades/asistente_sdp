@@ -62,7 +62,7 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.5.7")
+app = FastAPI(title="Asistente SDP - API puente", version="1.5.8")
 
 
 # ============================================================================
@@ -124,6 +124,13 @@ logger.info(
 _adapter = None
 if BotFrameworkAdapterSettings and BotFrameworkAdapter:
     _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
+    # 👇 Forzar tenant público del Bot Framework para auth de canal (Web Chat/Teams)
+    try:
+        setattr(_settings, "channel_auth_tenant", "botframework.com")
+    except Exception:
+        # si la clase no soporta el atributo, seguimos igual (no rompe)
+        pass
+
     _adapter = BotFrameworkAdapter(_settings)
     logger.info(
         "[bf] adapter listo | app_tail=%s | secret=%s",
@@ -450,7 +457,7 @@ def meta_sites():
         log_exec(endpoint="/meta/sites", action="meta_sites", ok=True)
         return res
     except Exception as e:
-        log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message=str(e))
+        log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message:str(e))
         logger.error(f"Error listando sites: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
@@ -462,7 +469,7 @@ def meta_templates():
         log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=True)
         return res
     except Exception as e:
-        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message=str(e))
+        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message:str(e))
         logger.error(f"Error listando plantillas: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
