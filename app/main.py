@@ -15,7 +15,7 @@ from pathlib import Path
 from logging.handlers import TimedRotatingFileHandler
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request   # ← Agregamos Request
 from fastapi.responses import Response
 
 # --- Cargar variables de entorno ---
@@ -61,8 +61,100 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.4.2")
+app = FastAPI(title="Asistente SDP - API puente", version="1.5.0")  # ↑ bump menor por nueva ruta
 
+
+# ============================================================================
+# Bot Framework: Adapter y endpoint /api/messages
+# ============================================================================
+
+# Entrada:
+#   - CREDENCIALES de Azure AD (MicrosoftAppId / MicrosoftAppPassword) vía env.
+# Qué hace:
+#   - Configura el adapter de Bot Framework y publica POST /api/messages para Teams.
+#   - Implementa un bot mínimo: welcome + respuesta a "hi/hello/hola".
+# Salida esperada:
+#   - HTTP 200 en /api/messages si procesa la actividad.
+try:
+    from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
+    from botbuilder.schema import Activity
+except Exception as _e:  # Importación opcional: si no está instalado, devolvemos 500 al usar la ruta
+    BotFrameworkAdapter = None
+    BotFrameworkAdapterSettings = None
+    TurnContext = None
+    Activity = None
+    logger.warning("botbuilder-core no disponible: instala 'botbuilder-core' y 'botbuilder-schema'.")
+
+MICROSOFT_APP_ID = os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID")
+MICROSOFT_APP_PASSWORD = os.getenv("MicrosoftAppPassword") or os.getenv("MicrosoftApp_PASSWORD") or os.getenv("MICROSOFT_APP_PASSWORD")
+
+_adapter = None
+if BotFrameworkAdapterSettings and BotFrameworkAdapter:
+    _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
+    _adapter = BotFrameworkAdapter(_settings)
+
+class AdmInfraBot:
+    """Bot mínimo para validación de canal (welcome + saludo básico)."""
+
+    async def on_turn(self, turn_context: "TurnContext"):
+        atype = turn_context.activity.type
+
+        if atype == "message":
+            text = (turn_context.activity.text or "").strip().lower()
+
+            # Respuesta mínima para validación y diagnóstico
+            if text in ("hi", "hello", "hola"):
+                await turn_context.send_activity("¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?")
+                return
+
+            # Aquí, luego, conectamos Azure OpenAI (call_openai) y/o intents a SDP
+            await turn_context.send_activity("Recibido. Procesando tu solicitud.")
+
+        elif atype == "conversationUpdate":
+            # Mensaje de bienvenida cuando agregan el bot (personal o team scope)
+            for m in (turn_context.activity.members_added or []):
+                if m.id != turn_context.activity.recipient.id:
+                    await turn_context.send_activity("Bienvenido/a a AdmInfraBot 👋")
+
+
+_bot_instance = AdmInfraBot()
+
+
+@app.post("/api/messages")
+async def messages(request: Request):
+    """
+    Entrada:
+        - Body: Activity del Bot Framework (Teams) en JSON.
+        - Header: Authorization (portador / firma del canal).
+    Qué hace:
+        - Deserializa la actividad y la procesa con el adapter de Bot Framework.
+        - Registra trazabilidad / logs de diagnóstico (sin romper la conversación).
+    Salida esperada:
+        - HTTP 200 sin contenido si se procesa correctamente.
+    """
+    if _adapter is None or Activity is None:
+        logger.error("Intento de uso de /api/messages sin botbuilder-core instalado.")
+        raise HTTPException(status_code=500, detail="Bot Framework no disponible. Instala botbuilder-core/schema.")
+
+    # Trazabilidad ligera (no crítica)
+    try:
+        log_exec(endpoint="/api/messages", action="bf_receive", ok=True)
+    except Exception:
+        pass
+
+    body = await request.json()
+    activity = Activity().deserialize(body)
+    auth_header = request.headers.get("Authorization", "")
+
+    # Procesar la actividad con tu bot
+    await _adapter.process_activity(activity, auth_header, lambda ctx: _bot_instance.on_turn(ctx))
+
+    return Response(status_code=200)
+
+
+# ============================================================================
+# Endpoints existentes (se mantienen igual)
+# ============================================================================
 
 @app.get("/health")
 def health():
