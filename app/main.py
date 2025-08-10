@@ -62,13 +62,12 @@ if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.5.4")
+app = FastAPI(title="Asistente SDP - API puente", version="1.5.5")
 
 
 # ============================================================================
 # Bot Framework: Adapter y endpoint /api/messages
 # ============================================================================
-
 try:
     from botbuilder.core import (
         BotFrameworkAdapter,
@@ -84,6 +83,14 @@ try:
     except Exception:
         class AuthenticationError(Exception):
             ...
+    # Confiar serviceUrl para evitar 401 al responder
+    try:
+        from botframework.connector.auth import MicrosoftAppCredentials  # type: ignore
+    except Exception:
+        class MicrosoftAppCredentials:  # fallback inofensivo si no está disponible
+            @staticmethod
+            def trust_service_url(url: str) -> None:
+                pass
 except Exception:
     BotFrameworkAdapter = None
     BotFrameworkAdapterSettings = None
@@ -93,6 +100,10 @@ except Exception:
     MessageFactory = None
     class AuthenticationError(Exception):
         ...
+    class MicrosoftAppCredentials:
+        @staticmethod
+        def trust_service_url(url: str) -> None:
+            pass
     logger.warning("botbuilder-core/schema no disponibles. Instala dependencias del Bot Framework.")
 
 # --- Lectura robusta de credenciales (alias + strip) ---
@@ -139,9 +150,24 @@ class AdmInfraBot(ActivityHandler):
 
     async def on_message_activity(self, turn_context: "TurnContext"):
         text = (turn_context.activity.text or "").strip().lower()
-        logger.info("on_message_activity IN | text=%s", text)
+        logger.info(
+            "on_message_activity IN | ch=%s | serviceUrl=%s | text=%s",
+            getattr(turn_context.activity, "channel_id", None),
+            getattr(turn_context.activity, "service_url", None),
+            text,
+        )
         try:
-            reply_text = "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?" if text in ("hi", "hello", "hola") else f"Recibí: {turn_context.activity.text}"
+            # Confiar la serviceUrl del canal que nos habló (Web Chat / Teams)
+            su = getattr(turn_context.activity, "service_url", None)
+            if su:
+                MicrosoftAppCredentials.trust_service_url(su)
+                logger.info("trusted serviceUrl=%s", su)
+
+            reply_text = (
+                "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?"
+                if text in ("hi", "hello", "hola")
+                else f"Recibí: {turn_context.activity.text}"
+            )
             res = await turn_context.send_activity(MessageFactory.text(reply_text))
             sent_id = getattr(res, "id", None)
             logger.info("on_message_activity OUT | sent_id=%s", sent_id)
@@ -206,6 +232,14 @@ async def messages(request: Request):
         log_exec(endpoint="/api/messages", action="bf_activity", params=ainfo, ok=True)
     except Exception as e:
         logger.warning("No se pudo loguear ainfo: %s", e)
+
+    # Confiar la serviceUrl tan pronto como la tengamos
+    try:
+        if getattr(activity, "service_url", None):
+            MicrosoftAppCredentials.trust_service_url(activity.service_url)
+            logger.info("trusted (early) serviceUrl=%s", activity.service_url)
+    except Exception as e:
+        logger.warning("No se pudo confiar serviceUrl temprano: %s", e)
 
     # Guarda conversation reference para pruebas /dev/ping
     try:
@@ -299,6 +333,9 @@ if DEV_TRACE_ENABLED:
         if not LAST_REF["ref"]:
             raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
         async def _send(ctx: TurnContext):
+            # Confiar (por si la referencia viene de otro host)
+            if getattr(ctx.activity, "service_url", None):
+                MicrosoftAppCredentials.trust_service_url(ctx.activity.service_url)
             res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
             logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
         await _adapter.continue_conversation(MICROSOFT_APP_ID, LAST_REF["ref"], _send)
@@ -386,7 +423,7 @@ def intent_note(ticket_id: int, email: str, note: str):
         return res
     except Exception as e:
         log_exec(endpoint="/intents/note", email=email, action="note",
-                 params={"ticket_id": ticket_id}, ok=False, code=502, message=str(e))
+                 params={"ticket_id": ticket_id}, ok=False, code=502, message:str(e))
         logger.error(f"Error agregando nota a ticket {ticket_id}: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
@@ -400,7 +437,7 @@ def intent_note_by_display(display_id: str, email: str, note: str):
         return res
     except Exception as e:
         log_exec(endpoint="/intents/note_by_display", email=email, action="note_by_display",
-                 params={"display_id": display_id}, ok=False, code=502, message=str(e))
+                 params={"display_id": display_id}, ok=False, code=502, message:str(e))
         logger.error(f"Error agregando nota a ticket {display_id}: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
@@ -412,7 +449,7 @@ def meta_sites():
         log_exec(endpoint="/meta/sites", action="meta_sites", ok=True)
         return res
     except Exception as e:
-        log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message=str(e))
+        log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message:str(e))
         logger.error(f"Error listando sites: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
@@ -424,7 +461,7 @@ def meta_templates():
         log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=True)
         return res
     except Exception as e:
-        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message=str(e))
+        log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message:str(e))
         logger.error(f"Error listando plantillas: {e}")
         raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
