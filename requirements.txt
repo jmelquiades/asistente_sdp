@@ -1,12 +1,15 @@
-fastapi
-uvicorn
-requests
-python-dotenv
-beautifulsoup4
+# Core
+fastapi==0.110.0
+uvicorn==0.29.0
+requests==2.31.0
+python-dotenv==1.0.1
+beautifulsoup4==4.12.3
 
-botbuilder-core==4.14.3
-botbuilder-schema==4.14.3
-botframework-connector==4.14.3
-aiohttp==3.8.5
+# Microsoft Bot Framework (conjunto compatible)
+botbuilder-core==4.14.4
+botbuilder-schema==4.14.4
+botframework-connector==4.14.4
+
+# Auth / HTTP
 msal==1.26.0
-4
+aiohttp==3.8.6
