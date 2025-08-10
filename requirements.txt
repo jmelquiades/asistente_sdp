@@ -3,3 +3,5 @@ uvicorn
 requests
 python-dotenv
 beautifulsoup4
+botbuilder-core
+botbuilder-schema
