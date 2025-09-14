@@ -36,17 +36,13 @@ from app.modules.trazabilidad import log_exec, list_recent
 # --- Feature flags ---
 DEV_TRACE_ENABLED = os.getenv("DEV_TRACE_ENABLED", "false").lower() in ("1", "true", "yes")
 
-# --- Logging (rotación diaria, retención 60 días + stdout para Render) ---
+# --- Logging (rotación diaria + stdout) ---
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 log_filename = LOG_DIR / "app.log"
-
-file_handler = TimedRotatingFileHandler(
-    filename=log_filename, when="midnight", interval=1, backupCount=60, encoding="utf-8"
-)
+file_handler = TimedRotatingFileHandler(filename=log_filename, when="midnight", interval=1, backupCount=60, encoding="utf-8")
 formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s", "%Y-%m-%d %H:%M:%S")
 file_handler.setFormatter(formatter)
-
 logger = logging.getLogger("asistente_sdp")
 logger.setLevel(logging.INFO)
 if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
@@ -56,7 +52,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.7.1")
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.2")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -90,7 +86,6 @@ except Exception:
     ChannelAccount = None
     ActivityHandler = object
     MessageFactory = None
-
     class AuthenticationError(Exception): ...
     class MicrosoftAppCredentials:
         @staticmethod
@@ -144,12 +139,10 @@ CREDS_OK_AT_BOOT = _creds_selftest()
 _adapter = None
 if BotFrameworkAdapterSettings and BotFrameworkAdapter:
     _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
-    # Tenant para validar el canal (GUID para Single-Tenant, 'botframework.com' para Multi)
     try:
-        setattr(_settings, "channel_auth_tenant", MICROSOFT_APP_TENANT_ID)
+        setattr(_settings, "channel_auth_tenant", MICROSOFT_APP_TENANT_ID)  # GUID si Single-Tenant
     except Exception:
         pass
-    # Scope para canales públicos
     try:
         setattr(_settings, "oauth_scope", "https://api.botframework.com/.default")
     except Exception:
@@ -171,34 +164,33 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
             await turn_context.send_activity("Ups, ocurrió un problema procesando tu mensaje. Intentemos nuevamente.")
         except Exception:
             pass
-
     _adapter.on_turn_error = _on_error
 
-# --- Conversation reference (guardada como dict serializable) ---
+# --- Conversation reference ---
 LAST_REF = {"ref": None}  # dict | None
 
-def _ensure_conversation_reference(ref_any):
-    """Acepta ConversationReference, dict o JSON string y devuelve ConversationReference."""
-    if isinstance(ref_any, ConversationReference):
-        return ref_any
+def _serialize_ref(activity: Activity):
+    """Guarda ConversationReference como dict (serializable) y loguea el tipo."""
+    try:
+        ref = TurnContext.get_conversation_reference(activity)
+        if ref:
+            LAST_REF["ref"] = ref.as_dict()
+            logger.info("ConversationReference almacenada (tipo=%s) conv.id=%s",
+                        type(LAST_REF["ref"]).__name__,
+                        getattr(getattr(activity, 'conversation', None), 'id', None))
+    except Exception as e:
+        logger.warning("No se pudo guardar ConversationReference: %s", e)
+
+def _deserialize_ref_any(ref_any) -> "ConversationReference":
+    """Convierte dict/JSON string a ConversationReference."""
     if isinstance(ref_any, str):
         try:
             ref_any = json.loads(ref_any)
         except Exception:
-            raise HTTPException(status_code=409, detail="Referencia inválida. Envía un mensaje al bot y reintenta.")
-    if isinstance(ref_any, dict):
-        conv = ref_any.get("conversation") or {}
-        bot  = ref_any.get("bot") or {}
-        user = ref_any.get("user") or {}
-        return ConversationReference(
-            channel_id  = ref_any.get("channel_id") or ref_any.get("channelId"),
-            service_url = ref_any.get("service_url") or ref_any.get("serviceUrl"),
-            activity_id = ref_any.get("activity_id") or ref_any.get("activityId"),
-            conversation= ConversationAccount(id=conv.get("id"), name=conv.get("name")),
-            bot         = ChannelAccount(id=bot.get("id"),  name=bot.get("name")),
-            user        = ChannelAccount(id=user.get("id"), name=user.get("name")),
-        )
-    raise HTTPException(status_code=409, detail="Referencia de conversación no disponible.")
+            raise HTTPException(status_code=409, detail="Referencia corrupta. Escribe 'hola' y reintenta.")
+    if not isinstance(ref_any, dict):
+        raise HTTPException(status_code=409, detail="Referencia inválida. Envía un mensaje al bot y reintenta.")
+    return ConversationReference().deserialize(ref_any)
 
 # --- Bot handler ---
 class AdmInfraBot(ActivityHandler):
@@ -216,16 +208,12 @@ class AdmInfraBot(ActivityHandler):
                 MicrosoftAppCredentials.trust_service_url(su)
                 logger.info("trusted serviceUrl=%s", su)
 
-            reply_text = (
-                "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?"
-                if text.lower() in ("hi", "hello", "hola")
-                else f"eco: {text}"
-            )
+            reply_text = "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?" if text.lower() in ("hi","hello","hola") else f"eco: {text}"
             res = await turn_context.send_activity(MessageFactory.text(reply_text))
-            sent_id = getattr(res, "id", None)
-            logger.info("on_message_activity OUT | sent_id=%s", sent_id)
+            logger.info("on_message_activity OUT | sent_id=%s", getattr(res, "id", None))
+
             try:
-                log_exec(endpoint="/api/messages", action="bf_sent", params={"id": sent_id}, ok=True)
+                log_exec(endpoint="/api/messages", action="bf_sent", params={"id": getattr(res, "id", None)}, ok=True)
             except Exception:
                 pass
         except Exception as e:
@@ -267,6 +255,7 @@ async def messages(request: Request):
 
     activity = Activity().deserialize(body)
 
+    # Log básico
     try:
         ainfo = {
             "type": activity.type,
@@ -282,22 +271,14 @@ async def messages(request: Request):
     except Exception as e:
         logger.warning("No se pudo loguear ainfo: %s", e)
 
-    # Guardar ConversationReference como dict (NO string)
-    try:
-        ref = TurnContext.get_conversation_reference(activity)
-        if ref:
-            LAST_REF["ref"] = ref.as_dict()
-            logger.info("ConversationReference almacenada (as_dict) con conversation.id=%s", ainfo.get("conversationId"))
-    except Exception as e:
-        logger.warning("No se pudo guardar ConversationReference: %s", e)
+    # Guardar ConversationReference como dict
+    _serialize_ref(activity)
 
     auth_header = request.headers.get("Authorization", "")
     logger.info("BF auth header present=%s", bool(auth_header))
 
     try:
-        invoke_response = await _adapter.process_activity(
-            activity, auth_header, lambda ctx: _bot_instance.on_turn(ctx)
-        )
+        invoke_response = await _adapter.process_activity(activity, auth_header, lambda ctx: _bot_instance.on_turn(ctx))
     except AuthenticationError as e:
         logger.warning("Auth BotFramework (401): %s", e)
         return Response(status_code=401, content="Unauthorized")
@@ -309,15 +290,10 @@ async def messages(request: Request):
         status_code = getattr(invoke_response, "status", None) or 200
         body_obj = getattr(invoke_response, "body", None)
         if isinstance(body_obj, (dict, list)):
-            content = json.dumps(body_obj)
-            media = "application/json"
-        elif isinstance(body_obj, str):
-            content = body_obj
-            media = "text/plain"
-        else:
-            content = ""
-            media = "text/plain"
-        return Response(content=content, media_type=media, status_code=status_code)
+            return Response(content=json.dumps(body_obj), media_type="application/json", status_code=status_code)
+        if isinstance(body_obj, str):
+            return Response(content=body_obj, media_type="text/plain", status_code=status_code)
+        return Response(status_code=status_code)
 
     return Response(status_code=200)
 
@@ -374,12 +350,7 @@ def dev_whoami():
         return {
             "ok": True,
             "env_app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
-            "token_claims": {
-                "appid": claims.get("appid"),
-                "aud": claims.get("aud"),
-                "iss": claims.get("iss"),
-                "exp_in": res.get("expires_in"),
-            },
+            "token_claims": {"appid": claims.get("appid"), "aud": claims.get("aud"), "iss": claims.get("iss"), "exp_in": res.get("expires_in")},
             "tenant_effective": MICROSOFT_APP_TENANT_ID,
         }
     except Exception as e:
@@ -391,14 +362,20 @@ def dev_config():
     return {
         "app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
         "tenant_effective": MICROSOFT_APP_TENANT_ID,
+        "dev_trace_enabled": DEV_TRACE_ENABLED,
     }
 
-# Expone qué hay guardado en memoria (para depurar proactivos)
 @diag.get("/dev/ref")
 def dev_ref():
     ref = LAST_REF["ref"]
     kind = type(ref).__name__
-    return {"kind": kind, "preview": (ref if isinstance(ref, dict) else str(ref))[:500]}
+    # serializa seguro para preview
+    try:
+        preview = json.dumps(ref, ensure_ascii=False) if isinstance(ref, dict) else str(ref)
+        preview = (preview or "")[:500]
+    except Exception as e:
+        preview = f"<no-preview: {e}>"
+    return {"kind": kind, "preview": preview}
 
 app.include_router(diag)
 
@@ -411,7 +388,7 @@ if DEV_TRACE_ENABLED:
         if not LAST_REF["ref"]:
             raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
 
-        # --- FIX DEFINITIVO: siempre deserializar a ConversationReference ---
+        # Siempre deserializa a ConversationReference
         ref_any = LAST_REF["ref"]
         if isinstance(ref_any, str):
             try:
@@ -422,6 +399,9 @@ if DEV_TRACE_ENABLED:
             raise HTTPException(status_code=409, detail="Referencia inválida (esperado dict).")
 
         ref = ConversationReference().deserialize(ref_any)
+        logger.info("dev_ping usando ref tipo=%s conv.id=%s",
+                    type(ref).__name__, getattr(getattr(ref, 'conversation', None), 'id', None))
+
         if getattr(ref, "service_url", None):
             MicrosoftAppCredentials.trust_service_url(ref.service_url)
 
@@ -602,5 +582,5 @@ def trace_recent(limit: int = Query(50, ge=1, le=500)):
         body = json.dumps(items, ensure_ascii=False, indent=2)
         return Response(content=body, media_type="application/json")
     except Exception as e:
-        logger.error(f"Error leyendo trazas: %s", e)
+        logger.error(f"Error leyendo trazas: {e}")
         raise HTTPException(status_code=500, detail="Trace read error")
