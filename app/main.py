@@ -613,3 +613,4 @@ def trace_recent(limit: int = Query(50, ge=1, le=500)):
     except Exception as e:
         logger.error(f"Error leyendo trazas: %s", e)
         raise HTTPException(status_code=500, detail="Trace read error")
+#comment
