@@ -37,9 +37,7 @@ DEV_TRACE_ENABLED = os.getenv("DEV_TRACE_ENABLED", "false").lower() in ("1", "tr
 # --- Configuración de logs (rotación diaria, 60 días) ---
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-# Sugerencia: nombre fijo y que el handler rote (evita duplicados por fecha en nombre de archivo)
-log_filename = LOG_DIR / "app.log"
+log_filename = LOG_DIR / "app.log"  # nombre fijo; la rotación agrega sufijos
 
 handler = TimedRotatingFileHandler(
     filename=log_filename,
@@ -59,13 +57,13 @@ logger.setLevel(logging.INFO)
 if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
-# >>> NUEVO: handler a stdout para que Render muestre errores en consola <<<
+# También a stdout para ver errores en Render
 sh = logging.StreamHandler()
 sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.6.1")
+app = FastAPI(title="Asistente SDP - API puente", version="1.6.2")
 
 # ============================================================================
 # Bot Framework: Adapter y endpoint /api/messages
@@ -78,7 +76,7 @@ try:
         ActivityHandler,
         MessageFactory,
     )
-    from botbuilder.schema import Activity, ConversationReference
+    from botbuilder.schema import Activity, ConversationReference, ConversationAccount, ChannelAccount
     try:
         from botframework.connector.auth import AuthenticationError  # type: ignore
     except Exception:
@@ -97,6 +95,8 @@ except Exception:
     TurnContext = None
     Activity = None
     ConversationReference = None
+    ConversationAccount = None
+    ChannelAccount = None
     ActivityHandler = object
     MessageFactory = None
     class AuthenticationError(Exception):
@@ -116,6 +116,33 @@ logger.info(
     (MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None),
     (len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0),
 )
+
+# --- Autotest de credenciales al arranque (MSAL) ---
+def _creds_selftest():
+    try:
+        import msal
+        authority = "https://login.microsoftonline.com/botframework.com"
+        scope = ["https://api.botframework.com/.default"]
+        cca = msal.ConfidentialClientApplication(
+            client_id=MICROSOFT_APP_ID,
+            client_credential=MICROSOFT_APP_PASSWORD,
+            authority=authority,
+        )
+        res = cca.acquire_token_for_client(scopes=scope)
+        ok = "access_token" in res
+        logger.info(
+            "[boot] creds_selftest=%s | app_tail=%s | expires_in=%s | error=%s",
+            "OK" if ok else "FAIL",
+            MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
+            res.get("expires_in"),
+            (res.get("error_description") or res.get("error"))[:180] if not ok else None,
+        )
+        return ok
+    except Exception as e:
+        logger.exception("[boot] creds_selftest EXCEPTION: %s", e)
+        return False
+
+CREDS_OK_AT_BOOT = _creds_selftest()
 
 _adapter = None
 if BotFrameworkAdapterSettings and BotFrameworkAdapter:
@@ -150,8 +177,8 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 
     _adapter.on_turn_error = _on_error
 
-# >>> CAMBIO: almacenamos la referencia como dict serializable
-LAST_REF = {"ref": None}  # ref -> dict(ConversationReference)
+# Guardamos ConversationReference como dict serializable
+LAST_REF = {"ref": None}  # dict o None
 
 class AdmInfraBot(ActivityHandler):
     async def on_message_activity(self, turn_context: "TurnContext"):
@@ -168,7 +195,7 @@ class AdmInfraBot(ActivityHandler):
                 MicrosoftAppCredentials.trust_service_url(su)
                 logger.info("trusted serviceUrl=%s", su)
 
-            # >>> OPCIONAL: eco mínimo para validar respuesta
+            # Eco mínimo para validar
             reply_text = (
                 "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?"
                 if text.lower() in ("hi", "hello", "hola")
@@ -183,6 +210,9 @@ class AdmInfraBot(ActivityHandler):
                 pass
         except Exception as e:
             logger.exception("send_activity failed: %s", e)
+            # Si es 401, registramos pista explícita
+            if "Unauthorized" in str(e):
+                logger.error("[hint] 401 al responder: AppId/secret del BOT en Render deben corresponder EXACTAMENTE al AppId configurado en Azure Bot (Configuration).")
             try:
                 log_exec(endpoint="/api/messages", action="bf_send_error", ok=False, message=str(e))
             except Exception:
@@ -230,7 +260,7 @@ async def messages(request: Request):
     except Exception as e:
         logger.warning("No se pudo loguear ainfo: %s", e)
 
-    # >>> CAMBIO: guardar ConversationReference como dict
+    # Guardar ConversationReference como dict
     try:
         ref = TurnContext.get_conversation_reference(activity)
         if ref:
@@ -281,6 +311,7 @@ def health_bot_creds():
         "app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
         "has_password": bool(MICROSOFT_APP_PASSWORD),
         "pwd_len": len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0,
+        "creds_selftest_ok": CREDS_OK_AT_BOOT,
     }
 
 @diag.get("/dev/test_token")
@@ -306,6 +337,32 @@ def dev_test_token():
 app.include_router(diag)
 
 # ============================================================================
+# Utilidades para referencias y proactivos
+# ============================================================================
+def _ensure_conversation_reference(ref_any):
+    """Acepta ConversationReference, dict o JSON string y devuelve ConversationReference."""
+    if isinstance(ref_any, ConversationReference):
+        return ref_any
+    if isinstance(ref_any, str):
+        try:
+            ref_any = json.loads(ref_any)
+        except Exception:
+            raise HTTPException(status_code=409, detail="Referencia inválida. Envía un mensaje al bot y reintenta.")
+    if isinstance(ref_any, dict):
+        conv = ref_any.get("conversation") or {}
+        bot  = ref_any.get("bot") or {}
+        user = ref_any.get("user") or {}
+        return ConversationReference(
+            channel_id  = ref_any.get("channel_id") or ref_any.get("channelId"),
+            service_url = ref_any.get("service_url") or ref_any.get("serviceUrl"),
+            activity_id = ref_any.get("activity_id") or ref_any.get("activityId"),
+            conversation= ConversationAccount(id=conv.get("id"), name=conv.get("name")),
+            bot         = ChannelAccount(id=bot.get("id"),  name=bot.get("name")),
+            user        = ChannelAccount(id=user.get("id"), name=user.get("name")),
+        )
+    raise HTTPException(status_code=409, detail="Referencia de conversación no disponible.")
+
+# ============================================================================
 # Endpoint de ping proactivo (solo si está habilitado DEV_TRACE_ENABLED)
 # ============================================================================
 if DEV_TRACE_ENABLED:
@@ -313,12 +370,7 @@ if DEV_TRACE_ENABLED:
     async def dev_ping():
         if not LAST_REF["ref"]:
             raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
-        # >>> CAMBIO: deserializar el dict a ConversationReference y confiar service_url
-        ref_dict = LAST_REF["ref"]
-        if isinstance(ref_dict, str):
-            # Caso legado: si quedó guardado como string, forzamos a rehacer la referencia
-            raise HTTPException(status_code=409, detail="Referencia incompleta. Envía un mensaje al bot y reintenta.")
-        ref = ConversationReference().deserialize(ref_dict)
+        ref = _ensure_conversation_reference(LAST_REF["ref"])
         if getattr(ref, "service_url", None):
             MicrosoftAppCredentials.trust_service_url(ref.service_url)
 
@@ -330,7 +382,7 @@ if DEV_TRACE_ENABLED:
         return {"ok": True}
 
 # ============================================================================
-# Opcional: webhook para notificar "Resuelto" proactivamente
+# Webhook para notificar "Resuelto" proactivamente
 # ============================================================================
 @app.post("/notify")
 async def notify(payload: dict = Body(...)):
@@ -340,7 +392,7 @@ async def notify(payload: dict = Body(...)):
     """
     if not LAST_REF["ref"]:
         raise HTTPException(status_code=409, detail="Sin referencia de conversación almacenada.")
-    ref = ConversationReference().deserialize(LAST_REF["ref"])
+    ref = _ensure_conversation_reference(LAST_REF["ref"])
     if getattr(ref, "service_url", None):
         MicrosoftAppCredentials.trust_service_url(ref.service_url)
 
