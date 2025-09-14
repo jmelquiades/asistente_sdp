@@ -550,3 +550,47 @@ def trace_recent(limit: int = Query(50, ge=1, le=500)):
     except Exception as e:
         logger.error(f"Error leyendo trazas: {e}")
         raise HTTPException(status_code=500, detail="Trace read error")
+
+import base64
+
+@app.get("/dev/whoami")
+def dev_whoami():
+    """
+    Muestra qué appid y aud salen en el token que usamos para responder al canal.
+    Sirve para comparar con el Microsoft App ID del recurso Azure Bot.
+    """
+    try:
+        import msal
+        authority = "https://login.microsoftonline.com/botframework.com"
+        scope = ["https://api.botframework.com/.default"]
+        cca = msal.ConfidentialClientApplication(
+            client_id=MICROSOFT_APP_ID,
+            client_credential=MICROSOFT_APP_PASSWORD,
+            authority=authority,
+        )
+        res = cca.acquire_token_for_client(scopes=scope)
+        if "access_token" not in res:
+            return {"ok": False, "error": res.get("error"), "error_description": res.get("error_description")}
+
+        token = res["access_token"]
+        # decode (sin validar firma) solo para ver claims
+        def _b64d(part):
+            rem = len(part) % 4
+            if rem: part += "=" * (4 - rem)
+            return json.loads(base64.urlsafe_b64decode(part.encode()).decode())
+        header, payload = token.split(".")[0:2]
+        claims = _b64d(payload)
+
+        return {
+            "ok": True,
+            "env_app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
+            "token_claims": {
+                "appid": claims.get("appid"),
+                "aud": claims.get("aud"),
+                "iss": claims.get("iss"),
+                "exp_in": res.get("expires_in"),
+            }
+        }
+    except Exception as e:
+        logger.exception("/dev/whoami failed: %s", e)
+        return {"ok": False, "error": str(e)}
