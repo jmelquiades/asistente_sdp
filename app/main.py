@@ -52,7 +52,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.7.3")
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.4")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -195,17 +195,27 @@ def _deserialize_ref_any(ref_any) -> "ConversationReference":
 # --- Wrapper de compatibilidad para proactive ---
 async def _continue_conversation_compat(ref_obj: "ConversationReference", logic):
     """
-    Algunas versiones del SDK Python usan:
-      - continue_conversation(reference, logic)
-    Otras usan:
-      - continue_conversation(bot_id, reference, logic)
-    Probamos 2 args y si falla por TypeError, probamos 3 args.
+    Firmas posibles en SDK:
+      A) continue_conversation(reference, logic, bot_id=...)
+      B) continue_conversation(bot_id, reference, logic)
+      C) continue_conversation(reference, logic)  # requiere claims o bot_id interno
+    Probamos A → B → C, con logs.
     """
+    # A) keyword bot_id
     try:
-        return await _adapter.continue_conversation(ref_obj, logic)  # firma 2 args
-    except TypeError as te:
-        logger.info("[compat] continue_conversation(reference, logic) no aplica (%s). Probando con bot_id...", te)
-        return await _adapter.continue_conversation(MICROSOFT_APP_ID, ref_obj, logic)  # firma 3 args
+        logger.info("[compat] Probando firma A: continue_conversation(ref, logic, bot_id=APP_ID)")
+        return await _adapter.continue_conversation(ref_obj, logic, bot_id=MICROSOFT_APP_ID)
+    except TypeError as te_a:
+        logger.info("[compat] Firma A no aplica (%s). Probando firma B...", te_a)
+    # B) 3 posicionales
+    try:
+        logger.info("[compat] Probando firma B: continue_conversation(APP_ID, ref, logic)")
+        return await _adapter.continue_conversation(MICROSOFT_APP_ID, ref_obj, logic)
+    except TypeError as te_b:
+        logger.info("[compat] Firma B tampoco aplica (%s). Probando firma C...", te_b)
+    # C) 2 args (puede fallar si el SDK exige bot_id/claims)
+    logger.info("[compat] Probando firma C: continue_conversation(ref, logic)")
+    return await _adapter.continue_conversation(ref_obj, logic)
 
 # --- Bot handler ---
 class AdmInfraBot(ActivityHandler):
@@ -384,7 +394,6 @@ def dev_config():
 def dev_ref():
     ref = LAST_REF["ref"]
     kind = type(ref).__name__
-    # serializa seguro para preview
     try:
         preview = json.dumps(ref, ensure_ascii=False) if isinstance(ref, dict) else str(ref)
         preview = (preview or "")[:500]
@@ -403,7 +412,6 @@ if DEV_TRACE_ENABLED:
         if not LAST_REF["ref"]:
             raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
 
-        # Siempre deserializa a ConversationReference
         ref_any = LAST_REF["ref"]
         if isinstance(ref_any, str):
             try:
@@ -424,8 +432,8 @@ if DEV_TRACE_ENABLED:
             res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
             logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
 
-        # --- FIRMA COMPATIBLE ---
-        return await _continue_conversation_compat(ref, _send)
+        await _continue_conversation_compat(ref, _send)
+        return {"ok": True}
 
 # Webhook ejemplo para notificar "Resuelto"
 @app.post("/notify")
@@ -450,8 +458,8 @@ async def notify(payload: dict = Body(...)):
         msg = f"El ticket #{payload.get('ticketId')} pasó a {payload.get('status', 'Resuelto')} ✅"
         await ctx.send_activity(msg)
 
-    # --- FIRMA COMPATIBLE ---
-    return await _continue_conversation_compat(ref, _send)
+    await _continue_conversation_compat(ref, _send)
+    return {"ok": True}
 
 # ============================================================================
 # Endpoints existentes (health + intents + meta)
