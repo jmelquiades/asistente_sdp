@@ -52,7 +52,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.7.7")
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.8")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -65,7 +65,12 @@ try:
         ActivityHandler,
         MessageFactory,
     )
-    from botbuilder.schema import Activity, ConversationReference, ChannelAccount, ConversationAccount
+    from botbuilder.schema import (
+        Activity,
+        ConversationReference,
+        ChannelAccount,
+        ConversationAccount,
+    )
     try:
         from botframework.connector.auth import AuthenticationError  # type: ignore
     except Exception:
@@ -166,29 +171,52 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 
 # --- Conversation reference + fallbacks ---
 LAST_REF = {
-    "ref": None,            # dict con la ConversationReference
+    "ref": None,            # dict con la ConversationReference (enriquecida)
     "service_url": None,    # str fallback
     "channel_id": None,     # str fallback
 }
 
 def _serialize_ref(activity: Activity):
+    """
+    Guarda la ConversationReference como dict y se asegura de INYECTAR
+    serviceUrl/channelId desde el activity entrante si el SDK no los puso.
+    Además, guarda fallbacks simples por si el dict se pierde.
+    """
     try:
-        ref = TurnContext.get_conversation_reference(activity)
-        if ref:
-            LAST_REF["ref"] = ref.as_dict()
-            # Guardamos fallbacks crudos del activity entrante
-            su = getattr(activity, "service_url", None)
-            ch = getattr(activity, "channel_id", None)
-            if su:
-                LAST_REF["service_url"] = su
-            if ch:
-                LAST_REF["channel_id"] = ch
-            logger.info(
-                "ConversationReference almacenada (tipo=%s) conv.id=%s | su_fallback=%s",
-                type(LAST_REF["ref"]).__name__,
-                getattr(getattr(activity, 'conversation', None), 'id', None),
-                LAST_REF["service_url"],
-            )
+        ref_obj = TurnContext.get_conversation_reference(activity)
+        if not ref_obj:
+            return
+        ref_dict = ref_obj.as_dict() or {}
+
+        # detectar valores del activity
+        su_in = getattr(activity, "service_url", None)
+        ch_in = getattr(activity, "channel_id", None)
+
+        # valores que pudieran estar en as_dict()
+        su_ref = ref_dict.get("serviceUrl") or ref_dict.get("service_url")
+        ch_ref = ref_dict.get("channelId") or ref_dict.get("channel_id")
+
+        # decidir finales
+        su_final = su_in or su_ref
+        ch_final = ch_in or ch_ref
+
+        # inyectar en el dict con ambas variantes de clave
+        if su_final:
+            ref_dict["serviceUrl"] = su_final
+            ref_dict["service_url"] = su_final
+            LAST_REF["service_url"] = su_final
+        if ch_final:
+            ref_dict["channelId"] = ch_final
+            ref_dict["channel_id"] = ch_final
+            LAST_REF["channel_id"] = ch_final
+
+        LAST_REF["ref"] = ref_dict
+        logger.info(
+            "ConversationReference almacenada (tipo=dict) conv.id=%s | su=%s | ch=%s",
+            (getattr(getattr(activity, 'conversation', None), 'id', None)),
+            su_final,
+            ch_final,
+        )
     except Exception as e:
         logger.warning("No se pudo guardar ConversationReference: %s", e)
 
@@ -207,6 +235,22 @@ def _extract_from_ref_dict(ref_dict: dict, *keys):
         if k in ref_dict and ref_dict[k]:
             return ref_dict[k]
     return None
+
+def _complete_ref_from_raw_and_fallbacks(ref: "ConversationReference", ref_raw: dict):
+    """Rellena en caliente service_url/channel_id/bot/user/conversation si vienen vacíos."""
+    su = getattr(ref, "service_url", None) or _extract_from_ref_dict(ref_raw, "serviceUrl", "service_url") or LAST_REF.get("service_url")
+    ch = getattr(ref, "channel_id", None) or _extract_from_ref_dict(ref_raw, "channelId", "channel_id") or LAST_REF.get("channel_id")
+    if not getattr(ref, "service_url", None) and su:
+        setattr(ref, "service_url", su)
+    if not getattr(ref, "channel_id", None) and ch:
+        setattr(ref, "channel_id", ch)
+    if not getattr(ref, "conversation", None) and isinstance(ref_raw.get("conversation"), dict):
+        setattr(ref, "conversation", ConversationAccount(id=ref_raw["conversation"].get("id")))
+    if not getattr(ref, "bot", None) and isinstance(ref_raw.get("bot"), dict):
+        setattr(ref, "bot", ChannelAccount(id=ref_raw["bot"].get("id"), name=ref_raw["bot"].get("name")))
+    if not getattr(ref, "user", None) and isinstance(ref_raw.get("user"), dict):
+        setattr(ref, "user", ChannelAccount(id=ref_raw["user"].get("id"), name=ref_raw["user"].get("name")))
+    return getattr(ref, "service_url", None), getattr(ref, "channel_id", None)
 
 # --- Wrapper de compatibilidad para proactive ---
 async def _continue_conversation_compat(ref_obj: "ConversationReference", logic):
@@ -230,27 +274,20 @@ async def _continue_conversation_compat(ref_obj: "ConversationReference", logic)
     logger.info("[compat] Probando firma C: continue_conversation(ref, logic)")
     return await _adapter.continue_conversation(ref_obj, logic)
 
-# --- Construcción explícita del Activity proactivo (con fallbacks) ---
+# --- Construcción explícita del Activity proactivo (opcional) ---
 def _build_proactive_activity(ref_obj: "ConversationReference", ref_raw: dict, text: str) -> Activity:
     a = Activity(type="message")
-    # service_url: ref_obj -> ref_raw (serviceUrl/service_url) -> fallback global
-    su = getattr(ref_obj, "service_url", None) or _extract_from_ref_dict(ref_raw, "serviceUrl", "service_url") or LAST_REF.get("service_url")
-    ch = getattr(ref_obj, "channel_id", None) or _extract_from_ref_dict(ref_raw, "channelId", "channel_id") or LAST_REF.get("channel_id")
-    a.service_url = su
-    a.channel_id = ch
-    # conversation / from / recipient desde ref_obj (si existe), si no, reconstruir desde raw
-    a.conversation = getattr(ref_obj, "conversation", None)
-    a.from_property = getattr(ref_obj, "bot", None)
-    a.recipient = getattr(ref_obj, "user", None)
-
-    # Si algo vino vacío (algunos SDKs lo pierden en deserialize), repoblar mínimo con IDs del dict crudo:
-    if not a.conversation and isinstance(ref_raw.get("conversation"), dict):
-        a.conversation = ConversationAccount(id=ref_raw["conversation"].get("id"))
-    if not a.from_property and isinstance(ref_raw.get("bot"), dict):
-        a.from_property = ChannelAccount(id=ref_raw["bot"].get("id"), name=ref_raw["bot"].get("name"))
-    if not a.recipient and isinstance(ref_raw.get("user"), dict):
-        a.recipient = ChannelAccount(id=ref_raw["user"].get("id"), name=ref_raw["user"].get("name"))
-
+    a.service_url = getattr(ref_obj, "service_url", None) or _extract_from_ref_dict(ref_raw, "serviceUrl", "service_url") or LAST_REF.get("service_url")
+    a.channel_id = getattr(ref_obj, "channel_id", None) or _extract_from_ref_dict(ref_raw, "channelId", "channel_id") or LAST_REF.get("channel_id")
+    a.conversation = getattr(ref_obj, "conversation", None) or (
+        ConversationAccount(id=ref_raw["conversation"]["id"]) if isinstance(ref_raw.get("conversation"), dict) else None
+    )
+    a.from_property = getattr(ref_obj, "bot", None) or (
+        ChannelAccount(id=ref_raw["bot"]["id"], name=ref_raw["bot"].get("name")) if isinstance(ref_raw.get("bot"), dict) else None
+    )
+    a.recipient = getattr(ref_obj, "user", None) or (
+        ChannelAccount(id=ref_raw["user"]["id"], name=ref_raw["user"].get("name")) if isinstance(ref_raw.get("user"), dict) else None
+    )
     a.text = text
     return a
 
@@ -333,7 +370,7 @@ async def messages(request: Request):
     except Exception as e:
         logger.warning("No se pudo loguear ainfo: %s", e)
 
-    # Guardar ConversationReference + fallbacks
+    # Guardar ConversationReference + fallbacks (+inyectar su/ch)
     _serialize_ref(activity)
 
     auth_header = request.headers.get("Authorization", "")
@@ -436,7 +473,11 @@ def dev_ref():
         preview = (preview or "")[:500]
     except Exception as e:
         preview = f"<no-preview: {e}>"
-    return {"kind": kind, "preview": preview, "fallbacks": {"service_url": LAST_REF.get("service_url"), "channel_id": LAST_REF.get("channel_id")}}
+    return {
+        "kind": kind,
+        "preview": preview,
+        "fallbacks": {"service_url": LAST_REF.get("service_url"), "channel_id": LAST_REF.get("channel_id")},
+    }
 
 app.include_router(diag)
 
@@ -459,11 +500,12 @@ if DEV_TRACE_ENABLED:
             raise HTTPException(status_code=409, detail="Referencia inválida (esperado dict).")
 
         ref = ConversationReference().deserialize(ref_any)
-        logger.info("dev_ping usando ref tipo=%s conv.id=%s",
-                    type(ref).__name__, getattr(getattr(ref, 'conversation', None), 'id', None))
 
-        # Resolver y confiar service_url
-        su = getattr(ref, "service_url", None) or _extract_from_ref_dict(ref_any, "serviceUrl", "service_url") or LAST_REF.get("service_url")
+        # Completar ref y confiar service_url
+        su, ch = _complete_ref_from_raw_and_fallbacks(ref, ref_any)
+        logger.info("dev_ping usando ref conv.id=%s | su=%s | ch=%s",
+                    getattr(getattr(ref, 'conversation', None), 'id', None), su, ch)
+
         if su:
             MicrosoftAppCredentials.trust_service_url(su)
         else:
@@ -496,8 +538,7 @@ async def notify(payload: dict = Body(...)):
         raise HTTPException(status_code=409, detail="Referencia inválida (esperado dict).")
 
     ref = ConversationReference().deserialize(ref_any)
-
-    su = getattr(ref, "service_url", None) or _extract_from_ref_dict(ref_any, "serviceUrl", "service_url") or LAST_REF.get("service_url")
+    su, ch = _complete_ref_from_raw_and_fallbacks(ref, ref_any)
     if su:
         MicrosoftAppCredentials.trust_service_url(su)
     else:
