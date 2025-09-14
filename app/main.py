@@ -5,7 +5,7 @@ Incluye logging diario con retención de 60 días, trazabilidad, estado de conve
 (last_seen) y envío proactivo (webhooks de notificación).
 Compatibilidad Single-Tenant / Multi-Tenant mediante MICROSOFT_APP_TENANT_ID.
 
-Version: 1.8.1
+Version: 1.8.2
 """
 
 import os
@@ -56,7 +56,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.8.1")
+app = FastAPI(title="Asistente SDP - API puente", version="1.8.2")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -73,7 +73,7 @@ try:
         UserState,
         AutoSaveStateMiddleware,
         StatePropertyAccessor,
-        BotStateSet,  # <--- NUEVO
+        BotStateSet,  # importante
     )
     from botbuilder.schema import (
         Activity,
@@ -189,13 +189,13 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 # --- Estado (memoria del proceso; en prod cambia a Redis/BD) ---
 conv_accessor: "StatePropertyAccessor" = None  # type: ignore
 user_accessor: "StatePropertyAccessor" = None  # type: ignore
-if _adapter and MemoryStorage and ConversationState and UserState and AutoSaveStateMiddleware:
+if _adapter and MemoryStorage and ConversationState and UserState and AutoSaveStateMiddleware and BotStateSet:
     _storage = MemoryStorage()  # TODO: en prod, reemplazar por Redis/Cosmos/Blob
     conversation_state = ConversationState(_storage)
     user_state = UserState(_storage)
 
-    # >>> FIX: AutoSaveStateMiddleware recibe BotStateSet en esta versión <<<
-    bot_state_set = BotStateSet(conversation_state, user_state)
+    # >>> FIX aquí: BotStateSet recibe una lista/iterable en esta versión <<<
+    bot_state_set = BotStateSet([conversation_state, user_state])
     _adapter.use(AutoSaveStateMiddleware(bot_state_set))
 
     conv_accessor = conversation_state.create_property("convdata")
