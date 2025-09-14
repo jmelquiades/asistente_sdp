@@ -5,7 +5,7 @@ Incluye logging diario con retención de 60 días, trazabilidad, estado de conve
 (last_seen) y envío proactivo (webhooks de notificación).
 Compatibilidad Single-Tenant / Multi-Tenant mediante MICROSOFT_APP_TENANT_ID.
 
-Version: 1.8.0
+Version: 1.8.1
 """
 
 import os
@@ -56,7 +56,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.8.0")
+app = FastAPI(title="Asistente SDP - API puente", version="1.8.1")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -73,6 +73,7 @@ try:
         UserState,
         AutoSaveStateMiddleware,
         StatePropertyAccessor,
+        BotStateSet,  # <--- NUEVO
     )
     from botbuilder.schema import (
         Activity,
@@ -103,6 +104,7 @@ except Exception:
     UserState = None
     AutoSaveStateMiddleware = None
     StatePropertyAccessor = None
+    BotStateSet = None
 
     class AuthenticationError(Exception): ...
     class MicrosoftAppCredentials:
@@ -191,24 +193,23 @@ if _adapter and MemoryStorage and ConversationState and UserState and AutoSaveSt
     _storage = MemoryStorage()  # TODO: en prod, reemplazar por Redis/Cosmos/Blob
     conversation_state = ConversationState(_storage)
     user_state = UserState(_storage)
-    _adapter.use(AutoSaveStateMiddleware(conversation_state, user_state))
+
+    # >>> FIX: AutoSaveStateMiddleware recibe BotStateSet en esta versión <<<
+    bot_state_set = BotStateSet(conversation_state, user_state)
+    _adapter.use(AutoSaveStateMiddleware(bot_state_set))
+
     conv_accessor = conversation_state.create_property("convdata")
     user_accessor = user_state.create_property("userdata")
     logger.info("[state] MemoryStorage habilitado (convdata/userdata)")
 
 # --- Conversation reference + fallbacks ---
 LAST_REF = {
-    "ref": None,            # dict con la ConversationReference (enriquecida)
-    "service_url": None,    # str fallback
-    "channel_id": None,     # str fallback
+    "ref": None,
+    "service_url": None,
+    "channel_id": None,
 }
 
 def _serialize_ref(activity: Activity):
-    """
-    Guarda la ConversationReference como dict y se asegura de INYECTAR
-    serviceUrl/channelId desde el activity entrante si el SDK no los puso.
-    Además, guarda fallbacks simples por si el dict se pierde.
-    """
     try:
         ref_obj = TurnContext.get_conversation_reference(activity)
         if not ref_obj:
@@ -260,7 +261,6 @@ def _extract_from_ref_dict(ref_dict: dict, *keys):
     return None
 
 def _complete_ref_from_raw_and_fallbacks(ref: "ConversationReference", ref_raw: dict):
-    """Rellena en caliente service_url/channel_id/bot/user/conversation si vienen vacíos."""
     su = getattr(ref, "service_url", None) or _extract_from_ref_dict(ref_raw, "serviceUrl", "service_url") or LAST_REF.get("service_url")
     ch = getattr(ref, "channel_id", None) or _extract_from_ref_dict(ref_raw, "channelId", "channel_id") or LAST_REF.get("channel_id")
     if not getattr(ref, "service_url", None) and su:
@@ -277,13 +277,6 @@ def _complete_ref_from_raw_and_fallbacks(ref: "ConversationReference", ref_raw: 
 
 # --- Wrapper de compatibilidad para proactive ---
 async def _continue_conversation_compat(ref_obj: "ConversationReference", logic):
-    """
-    Firmas posibles en SDK:
-      A) continue_conversation(reference, logic, bot_id=...)
-      B) continue_conversation(bot_id, reference, logic)
-      C) continue_conversation(reference, logic)
-    Probamos A → B → C, con logs.
-    """
     try:
         logger.info("[compat] Probando firma A: continue_conversation(ref, logic, bot_id=APP_ID)")
         return await _adapter.continue_conversation(ref_obj, logic, bot_id=MICROSOFT_APP_ID)
@@ -326,20 +319,17 @@ class AdmInfraBot(ActivityHandler):
             text_low,
         )
 
-        # Confiar el serviceUrl del turno
         su = getattr(turn_context.activity, "service_url", None)
         if su:
             MicrosoftAppCredentials.trust_service_url(su)
             logger.info("trusted serviceUrl=%s", su)
 
-        # === Estado de la conversación (last_seen) ===
         if conv_accessor:
             conv = await conv_accessor.get(turn_context, default_factory=dict)
             now = time.time()
             last_seen = conv.get("last_seen")
             conv["last_seen"] = now
 
-            # Si hubo inactividad >= 8 minutos, propone retomar
             INACTIVITY_SEC = 8 * 60
             if last_seen and (now - last_seen) >= INACTIVITY_SEC:
                 flow = conv.get("flow")
@@ -350,7 +340,6 @@ class AdmInfraBot(ActivityHandler):
                     msg = f"¡Volviste! Han pasado {int((now - last_seen)/60)} min. ¿Seguimos donde nos quedamos o empezamos algo nuevo?"
                 await turn_context.send_activity(MessageFactory.text(msg))
 
-        # Router mínimo (puedes sustituir por guion.json)
         reply_text = "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?" if text_low in ("hi","hello","hola") else f"eco: {text_raw}"
         res = await turn_context.send_activity(MessageFactory.text(reply_text))
         logger.info("on_message_activity OUT | sent_id=%s", getattr(res, "id", None))
@@ -366,7 +355,6 @@ class AdmInfraBot(ActivityHandler):
             MicrosoftAppCredentials.trust_service_url(su)
         for m in (members_added or []):
             if m.id != turn_context.activity.recipient.id:
-                # inicializa last_seen
                 if conv_accessor:
                     conv = await conv_accessor.get(turn_context, default_factory=dict)
                     conv["last_seen"] = time.time()
@@ -393,7 +381,6 @@ async def messages(request: Request):
 
     activity = Activity().deserialize(body)
 
-    # Log básico
     try:
         ainfo = {
             "type": activity.type,
@@ -409,7 +396,6 @@ async def messages(request: Request):
     except Exception as e:
         logger.warning("No se pudo loguear ainfo: %s", e)
 
-    # Guardar ConversationReference + fallbacks (+inyectar su/ch)
     _serialize_ref(activity)
 
     auth_header = request.headers.get("Authorization", "")
@@ -540,7 +526,6 @@ if DEV_TRACE_ENABLED:
 
         ref = ConversationReference().deserialize(ref_any)
 
-        # Completar ref y confiar service_url
         su, ch = _complete_ref_from_raw_and_fallbacks(ref, ref_any)
         logger.info("dev_ping usando ref conv.id=%s | su=%s | ch=%s",
                     getattr(getattr(ref, 'conversation', None), 'id', None), su, ch)
