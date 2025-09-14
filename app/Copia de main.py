@@ -1,27 +1,26 @@
 # app/main.py
 """
 API puente para integrar un bot conversacional con ServiceDesk Plus.
-Incluye logging diario con retención de 60 días y trazabilidad en base de datos.
-
-Entradas: Peticiones HTTP desde el bot u otros sistemas.
-Salidas: Respuestas JSON con datos de SDP o confirmación de operaciones.
+Incluye logging diario con retención de 60 días, trazabilidad y envío proactivo.
+Compatibilidad Single-Tenant / Multi-Tenant mediante MICROSOFT_APP_TENANT_ID.
 """
 
 import os
 import json
+import base64
 import logging
 from datetime import datetime
 from pathlib import Path
 from logging.handlers import TimedRotatingFileHandler
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Body, APIRouter
 from fastapi.responses import Response
-from fastapi import APIRouter
 
 # --- Cargar variables de entorno ---
 load_dotenv()
 
+# --- Módulos propios (SDP + Trazabilidad) ---
 from app.modules.sdp_actions import (
     get_announcements,
     create_ticket,
@@ -32,41 +31,35 @@ from app.modules.sdp_actions import (
     list_sites,
     list_request_templates,
 )
-from app.modules.trazabilidad import log_exec, list_recent  # trazabilidad
+from app.modules.trazabilidad import log_exec, list_recent
 
-# --- Config de feature flags ---
+# --- Feature flags ---
 DEV_TRACE_ENABLED = os.getenv("DEV_TRACE_ENABLED", "false").lower() in ("1", "true", "yes")
 
-# --- Configuración de logs (rotación diaria, 60 días) ---
+# --- Logging (rotación diaria, retención 60 días + stdout para Render) ---
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-log_filename = LOG_DIR / f"app_{datetime.now().strftime('%Y-%m-%d')}.log"
+log_filename = LOG_DIR / "app.log"
 
-handler = TimedRotatingFileHandler(
-    filename=log_filename,
-    when="midnight",
-    interval=1,
-    backupCount=60,  # Mantener 60 días de logs
-    encoding="utf-8",
+file_handler = TimedRotatingFileHandler(
+    filename=log_filename, when="midnight", interval=1, backupCount=60, encoding="utf-8"
 )
-formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-handler.setFormatter(formatter)
+formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s", "%Y-%m-%d %H:%M:%S")
+file_handler.setFormatter(formatter)
 
 logger = logging.getLogger("asistente_sdp")
 logger.setLevel(logging.INFO)
-# Evita duplicar handlers en reloads
 if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
-    logger.addHandler(handler)
+    logger.addHandler(file_handler)
+sh = logging.StreamHandler()
+sh.setFormatter(formatter)
+logger.addHandler(sh)
 
-# --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.6.0")
-
+# --- App FastAPI ---
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.0")
 
 # ============================================================================
-# Bot Framework: Adapter y endpoint /api/messages
+# Bot Framework (SDK v4)
 # ============================================================================
 try:
     from botbuilder.core import (
@@ -76,77 +69,102 @@ try:
         ActivityHandler,
         MessageFactory,
     )
-    from botbuilder.schema import Activity
+    from botbuilder.schema import Activity, ConversationReference, ConversationAccount, ChannelAccount
     try:
-        # Algunas instalaciones exponen AuthenticationError aquí; añadimos fallback
-        from botframework.connector.auth import AuthenticationError, MicrosoftAppCredentials  # type: ignore
+        from botframework.connector.auth import AuthenticationError  # type: ignore
     except Exception:
-        class AuthenticationError(Exception):
-            ...
-        class MicrosoftAppCredentials:  # fallback inofensivo si no está disponible
+        class AuthenticationError(Exception): ...
+    try:
+        from botframework.connector.auth import MicrosoftAppCredentials  # type: ignore
+    except Exception:
+        class MicrosoftAppCredentials:
             @staticmethod
-            def trust_service_url(url: str) -> None:
-                pass
+            def trust_service_url(url: str) -> None: ...
 except Exception:
     BotFrameworkAdapter = None
     BotFrameworkAdapterSettings = None
     TurnContext = None
     Activity = None
-    ActivityHandler = object  # fallback inocuo
+    ConversationReference = None
+    ConversationAccount = None
+    ChannelAccount = None
+    ActivityHandler = object
     MessageFactory = None
-    class AuthenticationError(Exception):
-        ...
+
+    class AuthenticationError(Exception): ...
     class MicrosoftAppCredentials:
         @staticmethod
-        def trust_service_url(url: str) -> None:
-            pass
+        def trust_service_url(url: str) -> None: ...
     logger.warning("botbuilder-core/schema no disponibles. Instala dependencias del Bot Framework.")
 
-# --- Lectura robusta de credenciales (alias + strip) ---
-MICROSOFT_APP_ID = (
-    os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID") or ""
-).strip()
-
-MICROSOFT_APP_PASSWORD = (
-    os.getenv("MicrosoftAppPassword") or os.getenv("MICROSOFT_APP_PASSWORD") or ""
+# --- Credenciales + Tenant ---
+MICROSOFT_APP_ID = (os.getenv("MicrosoftAppId") or os.getenv("MICROSOFT_APP_ID") or "").strip()
+MICROSOFT_APP_PASSWORD = (os.getenv("MicrosoftAppPassword") or os.getenv("MICROSOFT_APP_PASSWORD") or "").strip()
+# Single-Tenant: GUID de tu directorio; Multi-Tenant: 'botframework.com'
+MICROSOFT_APP_TENANT_ID = (
+    os.getenv("MicrosoftAppTenantId")
+    or os.getenv("MICROSOFT_APP_TENANT_ID")
+    or "botframework.com"
 ).strip()
 
 logger.info(
-    "[boot] BF creds -> app_tail=%s pwd_len=%s",
+    "[boot] BF creds -> app_tail=%s pwd_len=%s tenant=%s",
     (MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None),
     (len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0),
+    MICROSOFT_APP_TENANT_ID,
 )
 
+# --- Autotest de credenciales (MSAL) ---
+def _creds_selftest() -> bool:
+    try:
+        import msal
+        authority = f"https://login.microsoftonline.com/{MICROSOFT_APP_TENANT_ID}"
+        scope = ["https://api.botframework.com/.default"]
+        cca = msal.ConfidentialClientApplication(
+            client_id=MICROSOFT_APP_ID, client_credential=MICROSOFT_APP_PASSWORD, authority=authority
+        )
+        res = cca.acquire_token_for_client(scopes=scope)
+        ok = "access_token" in res
+        logger.info(
+            "[boot] creds_selftest=%s | app_tail=%s | tenant=%s | expires_in=%s | error=%s",
+            "OK" if ok else "FAIL",
+            MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
+            MICROSOFT_APP_TENANT_ID,
+            res.get("expires_in"),
+            (res.get("error_description") or res.get("error"))[:180] if not ok else None,
+        )
+        return ok
+    except Exception as e:
+        logger.exception("[boot] creds_selftest EXCEPTION: %s", e)
+        return False
+
+CREDS_OK_AT_BOOT = _creds_selftest()
+
+# --- Adapter ---
 _adapter = None
-_settings = None
 if BotFrameworkAdapterSettings and BotFrameworkAdapter:
     _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
-
-    # 👇 Forzar tenant público del Bot Framework para auth de canal (Web Chat/Teams)
+    # Tenant para validar el canal (GUID para Single-Tenant, 'botframework.com' para Multi)
     try:
-        setattr(_settings, "channel_auth_tenant", "botframework.com")
+        setattr(_settings, "channel_auth_tenant", MICROSOFT_APP_TENANT_ID)
     except Exception:
         pass
-
-    # 👇 Scope moderno AAD v2 para el servicio de canales
+    # Scope para canales públicos
     try:
-        current_scope = getattr(_settings, "oauth_scope", None)
-        desired_scope = "https://api.botframework.com/.default"
-        if current_scope != desired_scope:
-            setattr(_settings, "oauth_scope", desired_scope)
+        setattr(_settings, "oauth_scope", "https://api.botframework.com/.default")
     except Exception:
-        pass
+        try:
+            setattr(_settings, "oAuthScope", "https://api.botframework.com/.default")
+        except Exception:
+            pass
 
     _adapter = BotFrameworkAdapter(_settings)
     logger.info(
-        "[bf] adapter listo | app_tail=%s | secret=%s | tenant=%s | scope=%s",
+        "[bf] adapter listo | app_tail=%s | secret=%s",
         MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else "------",
         "ok" if bool(MICROSOFT_APP_PASSWORD) else "missing",
-        getattr(_settings, "channel_auth_tenant", None),
-        getattr(_settings, "oauth_scope", None),
     )
 
-    # --- on_turn_error: captura excepciones en el turno y las loguea ---
     async def _on_error(turn_context: "TurnContext", error: Exception):
         logger.exception("[bf.on_error] %s", error)
         try:
@@ -156,23 +174,43 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 
     _adapter.on_turn_error = _on_error
 
-# Guardamos una reference para pruebas de envío saliente
-LAST_REF = {"ref": None}
+# --- Conversation reference (guardada como dict serializable) ---
+LAST_REF = {"ref": None}  # dict | None
 
+def _ensure_conversation_reference(ref_any):
+    """Acepta ConversationReference, dict o JSON string y devuelve ConversationReference."""
+    if isinstance(ref_any, ConversationReference):
+        return ref_any
+    if isinstance(ref_any, str):
+        try:
+            ref_any = json.loads(ref_any)
+        except Exception:
+            raise HTTPException(status_code=409, detail="Referencia inválida. Envía un mensaje al bot y reintenta.")
+    if isinstance(ref_any, dict):
+        conv = ref_any.get("conversation") or {}
+        bot  = ref_any.get("bot") or {}
+        user = ref_any.get("user") or {}
+        return ConversationReference(
+            channel_id  = ref_any.get("channel_id") or ref_any.get("channelId"),
+            service_url = ref_any.get("service_url") or ref_any.get("serviceUrl"),
+            activity_id = ref_any.get("activity_id") or ref_any.get("activityId"),
+            conversation= ConversationAccount(id=conv.get("id"), name=conv.get("name")),
+            bot         = ChannelAccount(id=bot.get("id"),  name=bot.get("name")),
+            user        = ChannelAccount(id=user.get("id"), name=user.get("name")),
+        )
+    raise HTTPException(status_code=409, detail="Referencia de conversación no disponible.")
 
+# --- Bot handler ---
 class AdmInfraBot(ActivityHandler):
-    """Bot mínimo para validación de canal (welcome + saludo básico)."""
-
     async def on_message_activity(self, turn_context: "TurnContext"):
-        text = (turn_context.activity.text or "").strip().lower()
+        text = (turn_context.activity.text or "").strip()
         logger.info(
             "on_message_activity IN | ch=%s | serviceUrl=%s | text=%s",
             getattr(turn_context.activity, "channel_id", None),
             getattr(turn_context.activity, "service_url", None),
-            text,
+            text.lower(),
         )
         try:
-            # Confiar la serviceUrl del canal que nos habló (Web Chat / Teams)
             su = getattr(turn_context.activity, "service_url", None)
             if su:
                 MicrosoftAppCredentials.trust_service_url(su)
@@ -180,8 +218,8 @@ class AdmInfraBot(ActivityHandler):
 
             reply_text = (
                 "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?"
-                if text in ("hi", "hello", "hola")
-                else f"Recibí: {turn_context.activity.text}"
+                if text.lower() in ("hi", "hello", "hola")
+                else f"eco: {text}"
             )
             res = await turn_context.send_activity(MessageFactory.text(reply_text))
             sent_id = getattr(res, "id", None)
@@ -192,6 +230,8 @@ class AdmInfraBot(ActivityHandler):
                 pass
         except Exception as e:
             logger.exception("send_activity failed: %s", e)
+            if "Unauthorized" in str(e) or "access_token" in str(e):
+                logger.error("[hint] Revisa AppId/Secret y TENANT. Si el Bot es Single-Tenant, fija MicrosoftAppTenantId=<TU_TENANT_GUID>.")
             try:
                 log_exec(endpoint="/api/messages", action="bf_send_error", ok=False, message=str(e))
             except Exception:
@@ -199,32 +239,26 @@ class AdmInfraBot(ActivityHandler):
             raise
 
     async def on_members_added_activity(self, members_added, turn_context: "TurnContext"):
+        su = getattr(turn_context.activity, "service_url", None)
+        if su:
+            MicrosoftAppCredentials.trust_service_url(su)
         for m in (members_added or []):
             if m.id != turn_context.activity.recipient.id:
                 await turn_context.send_activity("Bienvenido/a a AdmInfraBot 👋")
 
-
 _bot_instance = AdmInfraBot()
-
 
 @app.post("/api/messages")
 async def messages(request: Request):
-    """
-    Entrada:
-        - Body: Activity del Bot Framework (Teams/WebChat) en JSON.
-        - Header: Authorization (portador / firma del canal).
-    """
     if _adapter is None or Activity is None:
         logger.error("Intento de uso de /api/messages sin botbuilder-core instalado.")
         raise HTTPException(status_code=500, detail="Bot Framework no disponible. Instala botbuilder-core/schema.")
 
-    # Trazabilidad ligera (no crítica)
     try:
         log_exec(endpoint="/api/messages", action="bf_receive", ok=True)
     except Exception:
         pass
 
-    # Body
     try:
         body = await request.json()
     except Exception as e:
@@ -233,7 +267,6 @@ async def messages(request: Request):
 
     activity = Activity().deserialize(body)
 
-    # Log diagnóstico de la actividad (incluye recipientId para ver qué AppId ve el canal)
     try:
         ainfo = {
             "type": activity.type,
@@ -249,25 +282,18 @@ async def messages(request: Request):
     except Exception as e:
         logger.warning("No se pudo loguear ainfo: %s", e)
 
-    # Confiar la serviceUrl tan pronto como la tengamos
+    # Guardar ConversationReference como dict (NO string)
     try:
-        if getattr(activity, "service_url", None):
-            MicrosoftAppCredentials.trust_service_url(activity.service_url)
-            logger.info("trusted (early) serviceUrl=%s", activity.service_url)
+        ref = TurnContext.get_conversation_reference(activity)
+        if ref:
+            LAST_REF["ref"] = ref.as_dict()
+            logger.info("ConversationReference almacenada (as_dict) con conversation.id=%s", ainfo.get("conversationId"))
     except Exception as e:
-        logger.warning("No se pudo confiar serviceUrl temprano: %s", e)
+        logger.warning("No se pudo guardar ConversationReference: %s", e)
 
-    # Guarda conversation reference para pruebas /dev/ping
-    try:
-        LAST_REF["ref"] = TurnContext.get_conversation_reference(activity)
-    except Exception:
-        pass
-
-    # Auth header
     auth_header = request.headers.get("Authorization", "")
     logger.info("BF auth header present=%s", bool(auth_header))
 
-    # Procesar la actividad con el bot
     try:
         invoke_response = await _adapter.process_activity(
             activity, auth_header, lambda ctx: _bot_instance.on_turn(ctx)
@@ -279,7 +305,6 @@ async def messages(request: Request):
         logger.exception("Error procesando actividad BF: %s: %s", type(e).__name__, e)
         raise HTTPException(status_code=500, detail="Adapter error")
 
-    # Si es una actividad "invoke", devolver el invokeResponse apropiado
     if invoke_response is not None:
         status_code = getattr(invoke_response, "status", None) or 200
         body_obj = getattr(invoke_response, "body", None)
@@ -294,12 +319,10 @@ async def messages(request: Request):
             media = "text/plain"
         return Response(content=content, media_type=media, status_code=status_code)
 
-    # Para mensajes normales, 200 vacío
     return Response(status_code=200)
 
-
 # ============================================================================
-# Endpoints de diagnóstico (credenciales y token AAD)
+# Diagnóstico / Developer
 # ============================================================================
 diag = APIRouter()
 
@@ -310,56 +333,101 @@ def health_bot_creds():
         "app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
         "has_password": bool(MICROSOFT_APP_PASSWORD),
         "pwd_len": len(MICROSOFT_APP_PASSWORD) if MICROSOFT_APP_PASSWORD else 0,
+        "creds_selftest_ok": CREDS_OK_AT_BOOT,
     }
 
 @diag.get("/dev/test_token")
 def dev_test_token():
-    """
-    Prueba directa contra AAD usando Client Credentials para el recurso de Bot Framework.
-    Authority correcto: botframework.com
-    """
     try:
         import msal
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"MSAL no disponible: {e}")
-
-    authority = "https://login.microsoftonline.com/botframework.com"
+    authority = f"https://login.microsoftonline.com/{MICROSOFT_APP_TENANT_ID}"
     scope = ["https://api.botframework.com/.default"]
-
     cca = msal.ConfidentialClientApplication(
-        client_id=MICROSOFT_APP_ID,
-        client_credential=MICROSOFT_APP_PASSWORD,
-        authority=authority,
+        client_id=MICROSOFT_APP_ID, client_credential=MICROSOFT_APP_PASSWORD, authority=authority
     )
     res = cca.acquire_token_for_client(scopes=scope)
-    safe = {k: v for k, v in res.items() if k != "access_token"}  # ocultar token
+    safe = {k: v for k, v in res.items() if k != "access_token"}
     safe["has_access_token"] = "access_token" in res
     return safe
 
-# ¡importante! incluir el router de diagnóstico
+@diag.get("/dev/whoami")
+def dev_whoami():
+    try:
+        import msal
+        authority = f"https://login.microsoftonline.com/{MICROSOFT_APP_TENANT_ID}"
+        scope = ["https://api.botframework.com/.default"]
+        cca = msal.ConfidentialClientApplication(
+            client_id=MICROSOFT_APP_ID, client_credential=MICROSOFT_APP_PASSWORD, authority=authority
+        )
+        res = cca.acquire_token_for_client(scopes=scope)
+        if "access_token" not in res:
+            return {"ok": False, "error": res.get("error"), "error_description": res.get("error_description")}
+        token = res["access_token"]
+        def _b64d(part):
+            rem = len(part) % 4
+            if rem: part += "=" * (4 - rem)
+            return json.loads(base64.urlsafe_b64decode(part.encode()).decode())
+        header, payload = token.split(".")[0:2]
+        claims = _b64d(payload)
+        return {
+            "ok": True,
+            "env_app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
+            "token_claims": {
+                "appid": claims.get("appid"),
+                "aud": claims.get("aud"),
+                "iss": claims.get("iss"),
+                "exp_in": res.get("expires_in"),
+            },
+            "tenant_effective": MICROSOFT_APP_TENANT_ID,
+        }
+    except Exception as e:
+        logger.exception("/dev/whoami failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+@diag.get("/dev/config")
+def dev_config():
+    return {
+        "app_id_tail": MICROSOFT_APP_ID[-6:] if MICROSOFT_APP_ID else None,
+        "tenant_effective": MICROSOFT_APP_TENANT_ID,
+    }
+
 app.include_router(diag)
 
-
 # ============================================================================
-# Endpoint de ping (solo si está habilitado DEV_TRACE_ENABLED)
+# Proactivo (solo si DEV_TRACE_ENABLED)
 # ============================================================================
 if DEV_TRACE_ENABLED:
     @app.post("/dev/ping")
     async def dev_ping():
         if not LAST_REF["ref"]:
             raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
+        ref = _ensure_conversation_reference(LAST_REF["ref"])
+        if getattr(ref, "service_url", None):
+            MicrosoftAppCredentials.trust_service_url(ref.service_url)
         async def _send(ctx: TurnContext):
-            # Confiar (por si la referencia viene de otro host)
-            if getattr(ctx.activity, "service_url", None):
-                MicrosoftAppCredentials.trust_service_url(ctx.activity.service_url)
             res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
             logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
-        await _adapter.continue_conversation(MICROSOFT_APP_ID, LAST_REF["ref"], _send)
+        await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
         return {"ok": True}
 
+# Webhook ejemplo para notificar "Resuelto"
+@app.post("/notify")
+async def notify(payload: dict = Body(...)):
+    if not LAST_REF["ref"]:
+        raise HTTPException(status_code=409, detail="Sin referencia de conversación almacenada.")
+    ref = _ensure_conversation_reference(LAST_REF["ref"])
+    if getattr(ref, "service_url", None):
+        MicrosoftAppCredentials.trust_service_url(ref.service_url)
+    async def _send(ctx: TurnContext):
+        msg = f"El ticket #{payload.get('ticketId')} pasó a {payload.get('status', 'Resuelto')} ✅"
+        await ctx.send_activity(msg)
+    await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
+    return {"ok": True}
 
 # ============================================================================
-# Endpoints existentes (se mantienen igual)
+# Endpoints existentes (health + intents + meta)
 # ============================================================================
 @app.get("/health")
 def health():
@@ -370,7 +438,6 @@ def health():
         pass
     return {"status": "ok"}
 
-# Sonda para confirmar versión de código en producción
 @app.get("/__ready")
 def __ready():
     return {"ok": True, "source": "app/main.py"}
@@ -392,8 +459,7 @@ def intent_create(subject: str, description: str, email: str):
     logger.info(f"Creando ticket | requester={email} | subject={subject}")
     try:
         res = create_ticket(email, subject, description)
-        log_exec(endpoint="/intents/create", email=email, action="create",
-                 params={"subject": subject}, ok=True)
+        log_exec(endpoint="/intents/create", email=email, action="create", params={"subject": subject}, ok=True)
         return res
     except Exception as e:
         log_exec(endpoint="/intents/create", email=email, action="create",
@@ -467,7 +533,7 @@ def meta_sites():
     except Exception as e:
         log_exec(endpoint="/meta/sites", action="meta_sites", ok=False, code=502, message=str(e))
         logger.error(f"Error listando sites: {e}")
-        raise HTTPException(status_code=502, detail="SDP error: {}".format(e))
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
 @app.get("/meta/request_templates")
 def meta_templates():
@@ -479,13 +545,12 @@ def meta_templates():
     except Exception as e:
         log_exec(endpoint="/meta/request_templates", action="meta_templates", ok=False, code=502, message=str(e))
         logger.error(f"Error listando plantillas: {e}")
-        raise HTTPException(status_code=502, detail="SDP error: {}".format(e))
+        raise HTTPException(status_code=502, detail=f"SDP error: {e}")
 
 @app.get("/meta/trace/recent")
 def trace_recent(limit: int = Query(50, ge=1, le=500)):
     if not DEV_TRACE_ENABLED:
         raise HTTPException(status_code=404, detail="Not Found")
-
     try:
         raw = list_recent(limit)
         items = []

@@ -56,7 +56,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.7.0")
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.1")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -393,6 +393,13 @@ def dev_config():
         "tenant_effective": MICROSOFT_APP_TENANT_ID,
     }
 
+# Expone qué hay guardado en memoria (para depurar proactivos)
+@diag.get("/dev/ref")
+def dev_ref():
+    ref = LAST_REF["ref"]
+    kind = type(ref).__name__
+    return {"kind": kind, "preview": (ref if isinstance(ref, dict) else str(ref))[:500]}
+
 app.include_router(diag)
 
 # ============================================================================
@@ -403,12 +410,25 @@ if DEV_TRACE_ENABLED:
     async def dev_ping():
         if not LAST_REF["ref"]:
             raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
-        ref = _ensure_conversation_reference(LAST_REF["ref"])
+
+        # --- FIX DEFINITIVO: siempre deserializar a ConversationReference ---
+        ref_any = LAST_REF["ref"]
+        if isinstance(ref_any, str):
+            try:
+                ref_any = json.loads(ref_any)
+            except Exception:
+                raise HTTPException(status_code=409, detail="Referencia corrupta. Escribe 'hola' y reintenta.")
+        if not isinstance(ref_any, dict):
+            raise HTTPException(status_code=409, detail="Referencia inválida (esperado dict).")
+
+        ref = ConversationReference().deserialize(ref_any)
         if getattr(ref, "service_url", None):
             MicrosoftAppCredentials.trust_service_url(ref.service_url)
+
         async def _send(ctx: TurnContext):
             res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
             logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
+
         await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
         return {"ok": True}
 
@@ -417,12 +437,24 @@ if DEV_TRACE_ENABLED:
 async def notify(payload: dict = Body(...)):
     if not LAST_REF["ref"]:
         raise HTTPException(status_code=409, detail="Sin referencia de conversación almacenada.")
-    ref = _ensure_conversation_reference(LAST_REF["ref"])
+
+    ref_any = LAST_REF["ref"]
+    if isinstance(ref_any, str):
+        try:
+            ref_any = json.loads(ref_any)
+        except Exception:
+            raise HTTPException(status_code=409, detail="Referencia corrupta. Escribe 'hola' y reintenta.")
+    if not isinstance(ref_any, dict):
+        raise HTTPException(status_code=409, detail="Referencia inválida (esperado dict).")
+
+    ref = ConversationReference().deserialize(ref_any)
     if getattr(ref, "service_url", None):
         MicrosoftAppCredentials.trust_service_url(ref.service_url)
+
     async def _send(ctx: TurnContext):
         msg = f"El ticket #{payload.get('ticketId')} pasó a {payload.get('status', 'Resuelto')} ✅"
         await ctx.send_activity(msg)
+
     await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
     return {"ok": True}
 
@@ -570,5 +602,5 @@ def trace_recent(limit: int = Query(50, ge=1, le=500)):
         body = json.dumps(items, ensure_ascii=False, indent=2)
         return Response(content=body, media_type="application/json")
     except Exception as e:
-        logger.error(f"Error leyendo trazas: {e}")
+        logger.error(f"Error leyendo trazas: %s", e)
         raise HTTPException(status_code=500, detail="Trace read error")
