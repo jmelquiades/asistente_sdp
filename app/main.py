@@ -52,7 +52,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.7.2")
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.3")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -191,6 +191,21 @@ def _deserialize_ref_any(ref_any) -> "ConversationReference":
     if not isinstance(ref_any, dict):
         raise HTTPException(status_code=409, detail="Referencia inválida. Envía un mensaje al bot y reintenta.")
     return ConversationReference().deserialize(ref_any)
+
+# --- Wrapper de compatibilidad para proactive ---
+async def _continue_conversation_compat(ref_obj: "ConversationReference", logic):
+    """
+    Algunas versiones del SDK Python usan:
+      - continue_conversation(reference, logic)
+    Otras usan:
+      - continue_conversation(bot_id, reference, logic)
+    Probamos 2 args y si falla por TypeError, probamos 3 args.
+    """
+    try:
+        return await _adapter.continue_conversation(ref_obj, logic)  # firma 2 args
+    except TypeError as te:
+        logger.info("[compat] continue_conversation(reference, logic) no aplica (%s). Probando con bot_id...", te)
+        return await _adapter.continue_conversation(MICROSOFT_APP_ID, ref_obj, logic)  # firma 3 args
 
 # --- Bot handler ---
 class AdmInfraBot(ActivityHandler):
@@ -409,8 +424,8 @@ if DEV_TRACE_ENABLED:
             res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
             logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
 
-        await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
-        return {"ok": True}
+        # --- FIRMA COMPATIBLE ---
+        return await _continue_conversation_compat(ref, _send)
 
 # Webhook ejemplo para notificar "Resuelto"
 @app.post("/notify")
@@ -435,8 +450,8 @@ async def notify(payload: dict = Body(...)):
         msg = f"El ticket #{payload.get('ticketId')} pasó a {payload.get('status', 'Resuelto')} ✅"
         await ctx.send_activity(msg)
 
-    await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
-    return {"ok": True}
+    # --- FIRMA COMPATIBLE ---
+    return await _continue_conversation_compat(ref, _send)
 
 # ============================================================================
 # Endpoints existentes (health + intents + meta)
@@ -582,5 +597,5 @@ def trace_recent(limit: int = Query(50, ge=1, le=500)):
         body = json.dumps(items, ensure_ascii=False, indent=2)
         return Response(content=body, media_type="application/json")
     except Exception as e:
-        logger.error(f"Error leyendo trazas: {e}")
+        logger.error(f"Error leyendo trazas: %s", e)
         raise HTTPException(status_code=500, detail="Trace read error")
