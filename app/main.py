@@ -5,7 +5,7 @@ Incluye logging diario con retención de 60 días, trazabilidad, estado de conve
 (last_seen) y envío proactivo (webhooks de notificación).
 Compatibilidad Single-Tenant / Multi-Tenant mediante MICROSOFT_APP_TENANT_ID.
 
-Version: 1.8.2
+Version: 1.8.3
 """
 
 import os
@@ -56,7 +56,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.8.2")
+app = FastAPI(title="Asistente SDP - API puente", version="1.8.3")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -71,9 +71,7 @@ try:
         MemoryStorage,
         ConversationState,
         UserState,
-        AutoSaveStateMiddleware,
         StatePropertyAccessor,
-        BotStateSet,  # importante
     )
     from botbuilder.schema import (
         Activity,
@@ -102,9 +100,7 @@ except Exception:
     MemoryStorage = None
     ConversationState = None
     UserState = None
-    AutoSaveStateMiddleware = None
     StatePropertyAccessor = None
-    BotStateSet = None
 
     class AuthenticationError(Exception): ...
     class MicrosoftAppCredentials:
@@ -155,12 +151,17 @@ def _creds_selftest() -> bool:
 
 CREDS_OK_AT_BOOT = _creds_selftest()
 
-# --- Adapter ---
+# --- Adapter + Estado (sin AutoSaveStateMiddleware) ---
 _adapter = None
+conversation_state = None
+user_state = None
+conv_accessor: "StatePropertyAccessor" = None  # type: ignore
+user_accessor: "StatePropertyAccessor" = None  # type: ignore
+
 if BotFrameworkAdapterSettings and BotFrameworkAdapter:
     _settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
     try:
-        setattr(_settings, "channel_auth_tenant", MICROSOFT_APP_TENANT_ID)  # GUID si Single-Tenant
+        setattr(_settings, "channel_auth_tenant", MICROSOFT_APP_TENANT_ID)
     except Exception:
         pass
     try:
@@ -186,21 +187,14 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
             pass
     _adapter.on_turn_error = _on_error
 
-# --- Estado (memoria del proceso; en prod cambia a Redis/BD) ---
-conv_accessor: "StatePropertyAccessor" = None  # type: ignore
-user_accessor: "StatePropertyAccessor" = None  # type: ignore
-if _adapter and MemoryStorage and ConversationState and UserState and AutoSaveStateMiddleware and BotStateSet:
-    _storage = MemoryStorage()  # TODO: en prod, reemplazar por Redis/Cosmos/Blob
-    conversation_state = ConversationState(_storage)
-    user_state = UserState(_storage)
-
-    # >>> FIX aquí: BotStateSet recibe una lista/iterable en esta versión <<<
-    bot_state_set = BotStateSet([conversation_state, user_state])
-    _adapter.use(AutoSaveStateMiddleware(bot_state_set))
-
-    conv_accessor = conversation_state.create_property("convdata")
-    user_accessor = user_state.create_property("userdata")
-    logger.info("[state] MemoryStorage habilitado (convdata/userdata)")
+    # Estado en memoria (en prod reemplazar por Redis/BD)
+    if MemoryStorage and ConversationState and UserState:
+        _storage = MemoryStorage()
+        conversation_state = ConversationState(_storage)
+        user_state = UserState(_storage)
+        conv_accessor = conversation_state.create_property("convdata")
+        user_accessor = user_state.create_property("userdata")
+        logger.info("[state] MemoryStorage habilitado (convdata/userdata)")
 
 # --- Conversation reference + fallbacks ---
 LAST_REF = {
@@ -278,17 +272,12 @@ def _complete_ref_from_raw_and_fallbacks(ref: "ConversationReference", ref_raw: 
 # --- Wrapper de compatibilidad para proactive ---
 async def _continue_conversation_compat(ref_obj: "ConversationReference", logic):
     try:
-        logger.info("[compat] Probando firma A: continue_conversation(ref, logic, bot_id=APP_ID)")
         return await _adapter.continue_conversation(ref_obj, logic, bot_id=MICROSOFT_APP_ID)
-    except TypeError as te_a:
-        logger.info("[compat] Firma A no aplica (%s). Probando firma B...", te_a)
-    try:
-        logger.info("[compat] Probando firma B: continue_conversation(APP_ID, ref, logic)")
-        return await _adapter.continue_conversation(MICROSOFT_APP_ID, ref_obj, logic)
-    except TypeError as te_b:
-        logger.info("[compat] Firma B tampoco aplica (%s). Probando firma C...", te_b)
-    logger.info("[compat] Probando firma C: continue_conversation(ref, logic)")
-    return await _adapter.continue_conversation(ref_obj, logic)
+    except TypeError:
+        try:
+            return await _adapter.continue_conversation(MICROSOFT_APP_ID, ref_obj, logic)
+        except TypeError:
+            return await _adapter.continue_conversation(ref_obj, logic)
 
 # --- Construcción explícita del Activity proactivo ---
 def _build_proactive_activity(ref_obj: "ConversationReference", ref_raw: dict, text: str) -> Activity:
@@ -324,11 +313,14 @@ class AdmInfraBot(ActivityHandler):
             MicrosoftAppCredentials.trust_service_url(su)
             logger.info("trusted serviceUrl=%s", su)
 
-        if conv_accessor:
-            conv = await conv_accessor.get(turn_context, default_factory=dict)
+        # Estado de conversación (sin default_factory, usar default_value)
+        if conv_accessor and conversation_state:
+            conv = await conv_accessor.get(turn_context, {})
             now = time.time()
             last_seen = conv.get("last_seen")
             conv["last_seen"] = now
+            # guardar back
+            await conv_accessor.set(turn_context, conv)
 
             INACTIVITY_SEC = 8 * 60
             if last_seen and (now - last_seen) >= INACTIVITY_SEC:
@@ -344,6 +336,12 @@ class AdmInfraBot(ActivityHandler):
         res = await turn_context.send_activity(MessageFactory.text(reply_text))
         logger.info("on_message_activity OUT | sent_id=%s", getattr(res, "id", None))
 
+        # Guardado manual de estado (evita AutoSaveStateMiddleware)
+        if conversation_state:
+            await conversation_state.save_changes(turn_context, force=False)
+        if user_state:
+            await user_state.save_changes(turn_context, force=False)
+
         try:
             log_exec(endpoint="/api/messages", action="bf_sent", params={"id": getattr(res, "id", None)}, ok=True)
         except Exception:
@@ -355,9 +353,11 @@ class AdmInfraBot(ActivityHandler):
             MicrosoftAppCredentials.trust_service_url(su)
         for m in (members_added or []):
             if m.id != turn_context.activity.recipient.id:
-                if conv_accessor:
-                    conv = await conv_accessor.get(turn_context, default_factory=dict)
+                if conv_accessor and conversation_state:
+                    conv = await conv_accessor.get(turn_context, {})
                     conv["last_seen"] = time.time()
+                    await conv_accessor.set(turn_context, conv)
+                    await conversation_state.save_changes(turn_context, force=False)
                 await turn_context.send_activity("Bienvenido/a a AdmInfraBot 👋")
 
 _bot_instance = AdmInfraBot()
@@ -543,6 +543,7 @@ if DEV_TRACE_ENABLED:
                         getattr(getattr(act, "conversation", None), "id", None))
             await ctx.send_activity(act)
 
+        # usar compat
         await _continue_conversation_compat(ref, _send)
         return {"ok": True}
 
