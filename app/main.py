@@ -52,7 +52,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.7.5")
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.6")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -211,6 +211,18 @@ async def _continue_conversation_compat(ref_obj: "ConversationReference", logic)
         logger.info("[compat] Firma B tampoco aplica (%s). Probando firma C...", te_b)
     logger.info("[compat] Probando firma C: continue_conversation(ref, logic)")
     return await _adapter.continue_conversation(ref_obj, logic)
+
+# --- Construcción explícita del Activity proactivo ---
+def _build_proactive_activity(ref: "ConversationReference", text: str) -> Activity:
+    a = Activity(type="message")
+    # Poblar TODO desde la referencia
+    a.service_url = getattr(ref, "service_url", None)
+    a.channel_id = getattr(ref, "channel_id", None)
+    a.conversation = getattr(ref, "conversation", None)
+    a.from_property = getattr(ref, "bot", None)
+    a.recipient = getattr(ref, "user", None)
+    a.text = text
+    return a
 
 # --- Bot handler ---
 class AdmInfraBot(ActivityHandler):
@@ -420,19 +432,15 @@ if DEV_TRACE_ENABLED:
         logger.info("dev_ping usando ref tipo=%s conv.id=%s",
                     type(ref).__name__, getattr(getattr(ref, 'conversation', None), 'id', None))
 
-        # Fijar/trust serviceUrl
         if getattr(ref, "service_url", None):
             MicrosoftAppCredentials.trust_service_url(ref.service_url)
 
         async def _send(ctx: TurnContext):
-            # --- FIX: Completar service_url desde la referencia si viene vacío ---
-            if not getattr(ctx.activity, "service_url", None) and getattr(ref, "service_url", None):
-                ctx.activity.service_url = ref.service_url
-                logger.info("[proactive] service_url in ctx.activity faltaba; se estableció a %s", ref.service_url)
-            if getattr(ctx.activity, "service_url", None):
-                MicrosoftAppCredentials.trust_service_url(ctx.activity.service_url)
-            res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
-            logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
+            act = _build_proactive_activity(ref, "pong ✅ (desde /dev/ping)")
+            logger.info("[proactive] sending explicit activity: service_url=%s conv.id=%s",
+                        getattr(act, "service_url", None),
+                        getattr(getattr(act, "conversation", None), "id", None))
+            await ctx.send_activity(act)
 
         await _continue_conversation_compat(ref, _send)
         return {"ok": True}
@@ -453,16 +461,16 @@ async def notify(payload: dict = Body(...)):
         raise HTTPException(status_code=409, detail="Referencia inválida (esperado dict).")
 
     ref = ConversationReference().deserialize(ref_any)
+    if getattr(ref, "service_url", None):
+        MicrosoftAppCredentials.trust_service_url(ref.service_url)
 
     async def _send(ctx: TurnContext):
-        # --- FIX igual que en /dev/ping ---
-        if not getattr(ctx.activity, "service_url", None) and getattr(ref, "service_url", None):
-            ctx.activity.service_url = ref.service_url
-            logger.info("[proactive] service_url in ctx.activity faltaba; se estableció a %s", ref.service_url)
-        if getattr(ctx.activity, "service_url", None):
-            MicrosoftAppCredentials.trust_service_url(ctx.activity.service_url)
         msg = f"El ticket #{payload.get('ticketId')} pasó a {payload.get('status', 'Resuelto')} ✅"
-        await ctx.send_activity(msg)
+        act = _build_proactive_activity(ref, msg)
+        logger.info("[proactive] sending explicit activity (notify): service_url=%s conv.id=%s",
+                    getattr(act, "service_url", None),
+                    getattr(getattr(act, "conversation", None), "id", None))
+        await ctx.send_activity(act)
 
     await _continue_conversation_compat(ref, _send)
     return {"ok": True}
@@ -613,4 +621,3 @@ def trace_recent(limit: int = Query(50, ge=1, le=500)):
     except Exception as e:
         logger.error(f"Error leyendo trazas: %s", e)
         raise HTTPException(status_code=500, detail="Trace read error")
-#comment
