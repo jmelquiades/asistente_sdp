@@ -52,7 +52,7 @@ sh.setFormatter(formatter)
 logger.addHandler(sh)
 
 # --- App FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.7.4")
+app = FastAPI(title="Asistente SDP - API puente", version="1.7.5")
 
 # ============================================================================
 # Bot Framework (SDK v4)
@@ -65,7 +65,7 @@ try:
         ActivityHandler,
         MessageFactory,
     )
-    from botbuilder.schema import Activity, ConversationReference, ConversationAccount, ChannelAccount
+    from botbuilder.schema import Activity, ConversationReference
     try:
         from botframework.connector.auth import AuthenticationError  # type: ignore
     except Exception:
@@ -82,8 +82,6 @@ except Exception:
     TurnContext = None
     Activity = None
     ConversationReference = None
-    ConversationAccount = None
-    ChannelAccount = None
     ActivityHandler = object
     MessageFactory = None
     class AuthenticationError(Exception): ...
@@ -170,19 +168,19 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 LAST_REF = {"ref": None}  # dict | None
 
 def _serialize_ref(activity: Activity):
-    """Guarda ConversationReference como dict (serializable) y loguea el tipo."""
     try:
         ref = TurnContext.get_conversation_reference(activity)
         if ref:
             LAST_REF["ref"] = ref.as_dict()
-            logger.info("ConversationReference almacenada (tipo=%s) conv.id=%s",
-                        type(LAST_REF["ref"]).__name__,
-                        getattr(getattr(activity, 'conversation', None), 'id', None))
+            logger.info(
+                "ConversationReference almacenada (tipo=%s) conv.id=%s",
+                type(LAST_REF["ref"]).__name__,
+                getattr(getattr(activity, 'conversation', None), 'id', None),
+            )
     except Exception as e:
         logger.warning("No se pudo guardar ConversationReference: %s", e)
 
 def _deserialize_ref_any(ref_any) -> "ConversationReference":
-    """Convierte dict/JSON string a ConversationReference."""
     if isinstance(ref_any, str):
         try:
             ref_any = json.loads(ref_any)
@@ -198,22 +196,19 @@ async def _continue_conversation_compat(ref_obj: "ConversationReference", logic)
     Firmas posibles en SDK:
       A) continue_conversation(reference, logic, bot_id=...)
       B) continue_conversation(bot_id, reference, logic)
-      C) continue_conversation(reference, logic)  # requiere claims o bot_id interno
+      C) continue_conversation(reference, logic)
     Probamos A → B → C, con logs.
     """
-    # A) keyword bot_id
     try:
         logger.info("[compat] Probando firma A: continue_conversation(ref, logic, bot_id=APP_ID)")
         return await _adapter.continue_conversation(ref_obj, logic, bot_id=MICROSOFT_APP_ID)
     except TypeError as te_a:
         logger.info("[compat] Firma A no aplica (%s). Probando firma B...", te_a)
-    # B) 3 posicionales
     try:
         logger.info("[compat] Probando firma B: continue_conversation(APP_ID, ref, logic)")
         return await _adapter.continue_conversation(MICROSOFT_APP_ID, ref_obj, logic)
     except TypeError as te_b:
         logger.info("[compat] Firma B tampoco aplica (%s). Probando firma C...", te_b)
-    # C) 2 args (puede fallar si el SDK exige bot_id/claims)
     logger.info("[compat] Probando firma C: continue_conversation(ref, logic)")
     return await _adapter.continue_conversation(ref_obj, logic)
 
@@ -425,10 +420,17 @@ if DEV_TRACE_ENABLED:
         logger.info("dev_ping usando ref tipo=%s conv.id=%s",
                     type(ref).__name__, getattr(getattr(ref, 'conversation', None), 'id', None))
 
+        # Fijar/trust serviceUrl
         if getattr(ref, "service_url", None):
             MicrosoftAppCredentials.trust_service_url(ref.service_url)
 
         async def _send(ctx: TurnContext):
+            # --- FIX: Completar service_url desde la referencia si viene vacío ---
+            if not getattr(ctx.activity, "service_url", None) and getattr(ref, "service_url", None):
+                ctx.activity.service_url = ref.service_url
+                logger.info("[proactive] service_url in ctx.activity faltaba; se estableció a %s", ref.service_url)
+            if getattr(ctx.activity, "service_url", None):
+                MicrosoftAppCredentials.trust_service_url(ctx.activity.service_url)
             res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
             logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
 
@@ -451,10 +453,14 @@ async def notify(payload: dict = Body(...)):
         raise HTTPException(status_code=409, detail="Referencia inválida (esperado dict).")
 
     ref = ConversationReference().deserialize(ref_any)
-    if getattr(ref, "service_url", None):
-        MicrosoftAppCredentials.trust_service_url(ref.service_url)
 
     async def _send(ctx: TurnContext):
+        # --- FIX igual que en /dev/ping ---
+        if not getattr(ctx.activity, "service_url", None) and getattr(ref, "service_url", None):
+            ctx.activity.service_url = ref.service_url
+            logger.info("[proactive] service_url in ctx.activity faltaba; se estableció a %s", ref.service_url)
+        if getattr(ctx.activity, "service_url", None):
+            MicrosoftAppCredentials.trust_service_url(ctx.activity.service_url)
         msg = f"El ticket #{payload.get('ticketId')} pasó a {payload.get('status', 'Resuelto')} ✅"
         await ctx.send_activity(msg)
 
