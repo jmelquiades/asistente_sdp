@@ -12,7 +12,7 @@ from pathlib import Path
 from logging.handlers import TimedRotatingFileHandler
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Body
 from fastapi.responses import Response
 from fastapi import APIRouter
 
@@ -37,7 +37,9 @@ DEV_TRACE_ENABLED = os.getenv("DEV_TRACE_ENABLED", "false").lower() in ("1", "tr
 # --- Configuración de logs (rotación diaria, 60 días) ---
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-log_filename = LOG_DIR / f"app_{datetime.now().strftime('%Y-%m-%d')}.log"
+
+# Sugerencia: nombre fijo y que el handler rote (evita duplicados por fecha en nombre de archivo)
+log_filename = LOG_DIR / "app.log"
 
 handler = TimedRotatingFileHandler(
     filename=log_filename,
@@ -57,8 +59,13 @@ logger.setLevel(logging.INFO)
 if not any(isinstance(h, TimedRotatingFileHandler) for h in logger.handlers):
     logger.addHandler(handler)
 
+# >>> NUEVO: handler a stdout para que Render muestre errores en consola <<<
+sh = logging.StreamHandler()
+sh.setFormatter(formatter)
+logger.addHandler(sh)
+
 # --- Crear aplicación FastAPI ---
-app = FastAPI(title="Asistente SDP - API puente", version="1.6.0")
+app = FastAPI(title="Asistente SDP - API puente", version="1.6.1")
 
 # ============================================================================
 # Bot Framework: Adapter y endpoint /api/messages
@@ -71,7 +78,7 @@ try:
         ActivityHandler,
         MessageFactory,
     )
-    from botbuilder.schema import Activity
+    from botbuilder.schema import Activity, ConversationReference
     try:
         from botframework.connector.auth import AuthenticationError  # type: ignore
     except Exception:
@@ -89,6 +96,7 @@ except Exception:
     BotFrameworkAdapterSettings = None
     TurnContext = None
     Activity = None
+    ConversationReference = None
     ActivityHandler = object
     MessageFactory = None
     class AuthenticationError(Exception):
@@ -142,16 +150,17 @@ if BotFrameworkAdapterSettings and BotFrameworkAdapter:
 
     _adapter.on_turn_error = _on_error
 
-LAST_REF = {"ref": None}
+# >>> CAMBIO: almacenamos la referencia como dict serializable
+LAST_REF = {"ref": None}  # ref -> dict(ConversationReference)
 
 class AdmInfraBot(ActivityHandler):
     async def on_message_activity(self, turn_context: "TurnContext"):
-        text = (turn_context.activity.text or "").strip().lower()
+        text = (turn_context.activity.text or "").strip()
         logger.info(
             "on_message_activity IN | ch=%s | serviceUrl=%s | text=%s",
             getattr(turn_context.activity, "channel_id", None),
             getattr(turn_context.activity, "service_url", None),
-            text,
+            text.lower(),
         )
         try:
             su = getattr(turn_context.activity, "service_url", None)
@@ -159,10 +168,11 @@ class AdmInfraBot(ActivityHandler):
                 MicrosoftAppCredentials.trust_service_url(su)
                 logger.info("trusted serviceUrl=%s", su)
 
+            # >>> OPCIONAL: eco mínimo para validar respuesta
             reply_text = (
                 "¡Hola! Soy AdmInfraBot. ¿En qué te ayudo?"
-                if text in ("hi", "hello", "hola")
-                else f"Recibí: {turn_context.activity.text}"
+                if text.lower() in ("hi", "hello", "hola")
+                else f"eco: {text}"
             )
             res = await turn_context.send_activity(MessageFactory.text(reply_text))
             sent_id = getattr(res, "id", None)
@@ -220,17 +230,14 @@ async def messages(request: Request):
     except Exception as e:
         logger.warning("No se pudo loguear ainfo: %s", e)
 
+    # >>> CAMBIO: guardar ConversationReference como dict
     try:
-        if getattr(activity, "service_url", None):
-            MicrosoftAppCredentials.trust_service_url(activity.service_url)
-            logger.info("trusted (early) serviceUrl=%s", activity.service_url)
+        ref = TurnContext.get_conversation_reference(activity)
+        if ref:
+            LAST_REF["ref"] = ref.as_dict()
+            logger.info("ConversationReference almacenada (as_dict) con conversation.id=%s", ainfo.get("conversationId"))
     except Exception as e:
-        logger.warning("No se pudo confiar serviceUrl temprano: %s", e)
-
-    try:
-        LAST_REF["ref"] = TurnContext.get_conversation_reference(activity)
-    except Exception:
-        pass
+        logger.warning("No se pudo guardar ConversationReference: %s", e)
 
     auth_header = request.headers.get("Authorization", "")
     logger.info("BF auth header present=%s", bool(auth_header))
@@ -299,20 +306,50 @@ def dev_test_token():
 app.include_router(diag)
 
 # ============================================================================
-# Endpoint de ping (solo si está habilitado DEV_TRACE_ENABLED)
+# Endpoint de ping proactivo (solo si está habilitado DEV_TRACE_ENABLED)
 # ============================================================================
 if DEV_TRACE_ENABLED:
     @app.post("/dev/ping")
     async def dev_ping():
         if not LAST_REF["ref"]:
             raise HTTPException(status_code=409, detail="Aún no se ha recibido ninguna conversación.")
+        # >>> CAMBIO: deserializar el dict a ConversationReference y confiar service_url
+        ref_dict = LAST_REF["ref"]
+        if isinstance(ref_dict, str):
+            # Caso legado: si quedó guardado como string, forzamos a rehacer la referencia
+            raise HTTPException(status_code=409, detail="Referencia incompleta. Envía un mensaje al bot y reintenta.")
+        ref = ConversationReference().deserialize(ref_dict)
+        if getattr(ref, "service_url", None):
+            MicrosoftAppCredentials.trust_service_url(ref.service_url)
+
         async def _send(ctx: TurnContext):
-            if getattr(ctx.activity, "service_url", None):
-                MicrosoftAppCredentials.trust_service_url(ctx.activity.service_url)
             res = await ctx.send_activity("pong ✅ (desde /dev/ping)")
             logger.info("dev_ping sent_id=%s", getattr(res, "id", None))
-        await _adapter.continue_conversation(MICROSOFT_APP_ID, LAST_REF["ref"], _send)
+
+        await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
         return {"ok": True}
+
+# ============================================================================
+# Opcional: webhook para notificar "Resuelto" proactivamente
+# ============================================================================
+@app.post("/notify")
+async def notify(payload: dict = Body(...)):
+    """
+    Espera payload como: {"ticketId": "12345", "status": "Resolved", "email": "..."}
+    En producción, idealmente recupera la referencia por user/ticket desde DB.
+    """
+    if not LAST_REF["ref"]:
+        raise HTTPException(status_code=409, detail="Sin referencia de conversación almacenada.")
+    ref = ConversationReference().deserialize(LAST_REF["ref"])
+    if getattr(ref, "service_url", None):
+        MicrosoftAppCredentials.trust_service_url(ref.service_url)
+
+    async def _send(ctx: TurnContext):
+        msg = f"El ticket #{payload.get('ticketId')} pasó a {payload.get('status', 'Resuelto')} ✅"
+        await ctx.send_activity(msg)
+
+    await _adapter.continue_conversation(MICROSOFT_APP_ID, ref, _send)
+    return {"ok": True}
 
 # ============================================================================
 # Endpoints existentes
